@@ -142,7 +142,7 @@ RSYNC_CMD_TEMPLATE = 'ssh -o StrictHostKeyChecking=no %s rsync -c %s %s:%s'
 
 CHUNK_SIZE = "40m"
 LOGGING_ENABLED = False
-LOG_FILE = "scpWave.log"
+LOG_FILE = "scpTsunami.log"
 VERBOSE_OUTPUT_ENABLED = False
 MAX_FAILCOUNT = 3 # maximum consecutive connection failures allowed per host
 
