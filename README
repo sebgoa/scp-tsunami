@@ -1,0 +1,15 @@
+files included in this repository:
+
+scpTsunami.py
+This is the original version of the script, used for measuring improvements
+made in newer versions.
+
+scpTsunamiA.py
+This is a stable, improved version of scpTsunami.py.
+
+scpTsunamiB.py
+This version adds improvements to scpTsunamiA.py, but is not considered
+stable.
+
+scpTsunamiE.py
+'E' for experimental. This is where new ideas are tested.
