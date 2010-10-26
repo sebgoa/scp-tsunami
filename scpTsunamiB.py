@@ -43,6 +43,9 @@ ABOUT
 
 -Requirements-
   Unix environment and basic tools (scp, split, rsync)
+  You will also need to setup ssh keys so you don't have to enter your
+    password for every connection.
+  You will also need enough disk space (2 times file size).
 
 -Summary-
   This script improves upon the previous version of scpWave by splitting 
@@ -113,13 +116,12 @@ Ideas for Performance
 To Fix
   1. output from 'split' not consistent on some machines 
      Getting index error with attempting to split the output lines.
+  2. transferring really small files
 
 Issues
-1. this version is slower than the previous! at least for 100MB transfers
-   to 7 hosts. find out why.
 2. multiple versions of rcp on some machines, having trouble using it.
-3. don't have a thread for each subprocess to avoid thread limit?
 4. blocking semaphores and ctrl-c behavior. 
+5. puts file on root host, too?
 
 updates
   9-22
@@ -499,7 +501,7 @@ class Transfer(threading.Thread):
 
             if ret == 0:
                 # transfer succeeded
-                if False:#self.options.verbose:
+                if self.options.verbose:
                     print '%s(%d) -> %s(%d) : (%s) success' % \
                         (seed.hostname, seed.transferslots, target.hostname, \
                              target.transferslots, self.chunk.filename)
@@ -579,7 +581,11 @@ def split_file(DB, options):
     s = Spawn('split --verbose -b %s %s %s' % \
                   (options.chunksize, options.filename, options.chunk_base_name))
 
-    curname = s.readline().split()[2].strip("`'")
+    try:
+        curname = s.readline().split()[2].strip("`'")
+    except Exception:
+        # if file is too small to split
+        curname = options.chunk_base_name + 'a'
     while curname:
         try:
             prevname = s.readline().split()[2].strip("`'")
@@ -596,6 +602,8 @@ def split_file(DB, options):
 
 
 def main():
+    print 'fix split_file() for really small files'
+    sys.exit(1)
     # init defaults
     options = Options()
     max_threads = MAX_THREADS
@@ -718,6 +726,7 @@ def main():
     # initialize the background command queue thread
     procsema = threading.Semaphore(max_procs)
     commandq = CommandQueue(procsema)
+    commandq.daemon = True
     commandq.start()
 
     if cleanonly is True:
@@ -735,6 +744,7 @@ def main():
 
     # split the file to transfer. chunk_base_name is the prefix for chunk names
     split_thread = threading.Thread(target=split_file, args=(DB, options))
+    split_thread.daemon = True
     split_thread.start()
 
     # semaphore to limit thread creation
@@ -783,6 +793,8 @@ if __name__ == '__main__':
     try:
         main()
         print 'done'
+    except SystemExit:
+        pass
     except Exception:
         print 'ERROR! ', sys.exc_info()[1]
         print 'exiting ...'
