@@ -110,18 +110,18 @@ Ideas for Performance
     use rsync to accomplish this. Also, could check if complete file
     already exists on the target and not run cat. Just set host's
     chunks needed list to empty like the root node.
-  - Have option to remove chunks only?
-      usage: ./scpTsunami clean <chunkbasename>
 
 To Fix
   1. output from 'split' not consistent on some machines 
      Getting index error with attempting to split the output lines.
-  2. transferring really small files
+  2. transferring really small files - fixed?
 
 Issues
 2. multiple versions of rcp on some machines, having trouble using it.
 4. blocking semaphores and ctrl-c behavior. 
 5. puts file on root host, too?
+6. ctrl-c behavior is iffy. If user hits ctrl-c, no new transfers will begin.
+   current transfers will receive a signal and stop on their own.
 
 updates
   9-22
@@ -135,6 +135,7 @@ import pty
 import time
 import Queue
 import random
+import shutil
 import getopt
 import threading
 from socket import gethostname
@@ -160,6 +161,7 @@ LOGGING_ENABLED = False
 LOG_FILE = 'scpTsunami.log'
 VERBOSE_OUTPUT_ENABLED = False
 MAX_FAILCOUNT = 3 # maximum consecutive connection failures allowed per host
+CHUNK_DIR = '/tmp' # where to put chunks
 
 def _usage():
     print '''
@@ -167,9 +169,9 @@ Usage
  Transfer a file
  ./scpTsunami.py <file> <filedest> [-s][-v] [-u <username>] [-f <hostfile>]
                  [-l '<host1> <host2> ...'] [-r 'basehost[0-1,4-6,...]']
- Remove chunks from a prior transfer
+ Remove chunks from a previously transferred <file>
  ./scpTsunami.py clean <file> [-u <username>] [-f <hostfile>]
-                 [-l '<host1> <host2> ...'] [-r 'basehost[0-1,4-6,...]'] '''
+                 [-l '<host1> <host2> ...'] [-r 'basehost[0-1,4-6,...]']'''
 
 def _help():
     print '''
@@ -177,7 +179,7 @@ Arguments
   If the first argument is 'clean', scpTsunami will attempt to remove chunks
   from a prior transfer of the filename given as the second argument. Else,
   scpTsunami will attempt to transfer the filename given as argument one to
-  the path specified in the second argument.
+  the path specified in the second argument to all hosts.
 
 Mandatory options - must use at least 1
   -l '<host1> <host2>' ...     list of hosts to receive the file
@@ -194,16 +196,17 @@ Other options
   -t    specify maximum number of concurrent transfers per host
   -p    allow chunks to persist on target machines (disables clean up)
  
-  --rsync use rsync to transfer or update files based on checksum
-  --scp   use scp to transfer files
-  --rcp   use rcp to transfer files'''
+  --rsync     use rsync to transfer or update files based on checksum
+  --scp       use scp to transfer files
+  --rcp       use rcp to transfer files
+  --chunkdir  specify directory for storing chunks on all hosts
+  --help      display this message
+  --logfile   where to write log information'''
 
 ### End global data ###
 
 
-
 ### Class Definitions ###
-
 
 class Spawn:
     ''' 
@@ -277,10 +280,12 @@ class Logger:
 class CommandQueue(threading.Thread):
     ''' a threaded queue class for running rm and cat commands. Instead of 
     having a thread for each subprocess, this single thread will create 
-    multiple processes. '''
+    multiple processes. 
+
+    Do we need to run through shell?
+    '''
     def __init__(self, procsema):
         threading.Thread.__init__(self)
-        self.daemon = True
         self.cmdq = Queue.Queue()
         self.procsema = procsema
         self.flag = threading.Event()
@@ -329,6 +334,20 @@ class CommandQueue(threading.Thread):
     def finish(self):
         ''' empty the queue then quit '''
         self.flag.set()
+
+    def killall(self):
+        ''' stop creation of new processes and kill those that are active '''
+        #empty the queue
+        try:
+            while True:
+                self.cmdq.get_nowait()
+        except Queue.Empty:
+            pass
+        for proc in self.procs:
+            try:
+                os.kill(proc.pid, 9)
+            except Exception:
+                pass
 
 
 class Host:
@@ -574,7 +593,7 @@ def initiateTransfers(DB, threadsema, options, logger, threadlist, commandq):
         time.sleep(0.5)
 
 
-def split_file(DB, options):
+def split_file(DB, options, flag):
     ''' split a file into chunks as a separate thread so transfers may begin
     as soon as first chunk is created. 
     NOTE - this function relies on a certain output format for split. '''
@@ -586,7 +605,8 @@ def split_file(DB, options):
     except Exception:
         # if file is too small to split
         curname = options.chunk_base_name + 'a'
-    while curname:
+        shutil.copy(options.filename, curname)
+    while curname and not flag.isSet():
         try:
             prevname = s.readline().split()[2].strip("`'")
         except Exception:
@@ -597,13 +617,18 @@ def split_file(DB, options):
         DB.update_chunks_needed()
         curname = prevname
 
+    if flag.isSet():
+        # exiting early, kill the split process
+        try:
+            os.kill(s.pid, 9)
+        except Exception:
+            pass
+
     print 'split complete!'
     DB.split_complete = True
 
 
 def main():
-    print 'fix split_file() for really small files'
-    sys.exit(1)
     # init defaults
     options = Options()
     max_threads = MAX_THREADS
@@ -613,18 +638,20 @@ def main():
     cat_cmd_template = CAT_CMD_TEMPLATE
     logfile = LOG_FILE
     cleanonly = False # just remove chunks and exit
+    chunkdir = CHUNK_DIR
 
     # get the command line options
     try:
         optlist, args = getopt.gnu_getopt( \
-            sys.argv[1:], 't:u:f:r:l:b:svhp', ['help', 'rsync', 'scp', 'rcp'])
+            sys.argv[1:], 't:u:f:r:l:b:svhp', ['help', 'rsync', 'scp', 'rcp',\
+                                                   'chunkdir=','logfile='])
         for opt, arg in optlist:
-            if opt == '-h' or opt == '--help':
+            if opt in ('-h', '--help'):
                 _usage()
                 _help()
                 sys.exit(0)
     except Exception:
-        print 'ERROR options: ', sys.exc_info()[1]
+        print 'ERROR: options: ', sys.exc_info()[1]
         sys.exit(1)
 
     if len(args) < 2:
@@ -706,6 +733,12 @@ def main():
             options.cp_cmd_template = SCP_CMD_TEMPLATE
         elif opt == '--rcp':   # use rcp
             options.cp_cmd_template = RCP_CMD_TEMPLATE
+        elif opt == '--chunkdir':
+            chunkdir = arg
+        elif opt == '--logfile':
+            logfile = arg
+        else:
+            print 'invalid option: %s' % opt
 
 
     # set up a list database of all hosts
@@ -721,7 +754,7 @@ def main():
 
     # build prefix for file chunk names
     options.chunk_base_name = \
-        os.path.join('/tmp', os.path.split(options.filename)[-1])+ '.chunk_'
+        os.path.join(chunkdir, os.path.split(options.filename)[-1])+ '.chunk_'
 
     # initialize the background command queue thread
     procsema = threading.Semaphore(max_procs)
@@ -743,7 +776,9 @@ def main():
         sys.exit(0)
 
     # split the file to transfer. chunk_base_name is the prefix for chunk names
-    split_thread = threading.Thread(target=split_file, args=(DB, options))
+    splitflag = threading.Event()
+    split_thread = \
+        threading.Thread(target=split_file, args=(DB, options, splitflag))
     split_thread.daemon = True
     split_thread.start()
 
@@ -761,18 +796,22 @@ def main():
         # returns once transfers are complete
         initiateTransfers(DB, threadsema, options, logger, threadlist, commandq)
         print '%d transfers complete' % (DB.hosts_with_file - 1)
-    except Exception:
-        print 'ERROR ', sys.exc_info()[1]
     except KeyboardInterrupt:
-        print '[!] caught interrupt'
+        splitflag.set() # have split_file() exit, kill split process
+        commandq.killall() # stop current processes (calls to cat)
+        print '[!] aborted transfers'
+    except Exception:
+        splitflag.set()
+        commandq.killall()
+        print 'ERROR: initiateTransfers() ', sys.exc_info()[1]
 
     # in case transfers were interrupted, let threads finish execution.
-    while threadlist != []: 
+    while threadlist != [] and split_thread.isAlive():
         time.sleep(0.5)
 
     # must wait for cat processes to finish
     if options.cleanup is True:
-        # rm all chunks
+        print 'removing chunks ...'
         commandq.wait_for_procs()
         for host in DB.hostlist:
             rmCmd = rm_cmd_template % \
@@ -780,7 +819,7 @@ def main():
             commandq.put(rmCmd)
 
     # wait for procs to finish
-    commandq.finish()
+    commandq.finish() # finish work on current queue, then exit
     while commandq.isAlive():
         time.sleep(0.5)
 
@@ -795,8 +834,8 @@ if __name__ == '__main__':
         print 'done'
     except SystemExit:
         pass
-    except Exception:
-        print 'ERROR! ', sys.exc_info()[1]
-        print 'exiting ...'
     except KeyboardInterrupt:
+        print '[!] aborted'
+    except Exception:
+        print 'ERROR: main() ', sys.exc_info()[1]
         print 'exiting ...'
