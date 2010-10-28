@@ -42,19 +42,21 @@ ABOUT
   Python script for distributing large files over a cluster.
 
 -Requirements-
-  Unix environment and basic tools (scp, split, rsync)
+  Unix environment and basic tools (scp, split)
   You will also need to setup ssh keys so you don't have to enter your
     password for every connection.
   You will also need enough disk space (2 times file size).
 
 -Summary-
-  This script improves upon the previous version of scpWave by splitting 
+  This script improves upon the previous version (scpWave) by splitting 
   the file to transfer into chunks, similar to bitTorrent. A single host
   starts with the file and splits it into chunks. From there, this initial
   host begins sending out the chunks to target machines. Once a target
   receives a chunk, it may then transfer that chunk to other hosts. This 
-  happens until all available hosts have all chunks, at which point the 
-  chunks are concatenated into a single file.
+  happens until all available hosts have all chunks. Hosts will rebuld the
+  file as soon as all the chunks are received. Chunks will be removed as
+  soon as all calls to 'cat' exit
+
 
 -Platform Specific Issues-
   1. scpTsunami relies on a certain format for the split command's 
@@ -118,10 +120,9 @@ To Fix
 
 Issues
 2. multiple versions of rcp on some machines, having trouble using it.
-4. blocking semaphores and ctrl-c behavior. 
 5. puts file on root host, too?
 6. ctrl-c behavior is iffy. If user hits ctrl-c, no new transfers will begin.
-   current transfers will receive a signal and stop on their own.
+   Not sure what threads receive the signal.
 
 updates
   9-22
@@ -161,7 +162,7 @@ LOGGING_ENABLED = False
 LOG_FILE = 'scpTsunami.log'
 VERBOSE_OUTPUT_ENABLED = False
 MAX_FAILCOUNT = 3 # maximum consecutive connection failures allowed per host
-CHUNK_DIR = '/tmp' # where to put chunks
+CHUNK_DIR = '/local_scratch' # where to put chunks
 
 def _usage():
     print '''
@@ -372,6 +373,7 @@ class Host:
         self.lock.acquire()
         self.failcount += 1
         self.lock.release()
+        return (self.failcount == self.max_failcount)
 
     def resetFailCount(self):
         self.lock.acquire()
@@ -520,7 +522,7 @@ class Transfer(threading.Thread):
 
             if ret == 0:
                 # transfer succeeded
-                if self.options.verbose:
+                if False:#self.options.verbose:
                     print '%s(%d) -> %s(%d) : (%s) success' % \
                         (seed.hostname, seed.transferslots, target.hostname, \
                              target.transferslots, self.chunk.filename)
@@ -551,9 +553,15 @@ class Transfer(threading.Thread):
                 # check if host is up and accepting ssh connections
                 if not target.isAlive():
                     target.setDead()
-                if not seed.isAlive():
+                elif not seed.isAlive():
                     seed.setDead()
+                elif target.incFailCount():
+                    # no guarantee that target is at fault but this works...
+                    target.setDead()
 
+
+        except KeyboardInterrupt:
+            pass
         except Exception:
             # failed to start transfer?
             if self.chunk not in target.chunks_needed:
@@ -582,6 +590,7 @@ def initiateTransfers(DB, threadsema, options, logger, threadlist, commandq):
                 DB, seedindex, chunk, targetindex, threadlist, threadsema, \
                     options, logger, commandq)
             threadlist.append(transferThread)
+            transferThread.daemon = True
             transferThread.start()
         else:
             # having sleep prevents repeated failed calls to DB.getTransfer()
@@ -593,40 +602,46 @@ def initiateTransfers(DB, threadsema, options, logger, threadlist, commandq):
         time.sleep(0.5)
 
 
-def split_file(DB, options, flag):
-    ''' split a file into chunks as a separate thread so transfers may begin
-    as soon as first chunk is created. 
-    NOTE - this function relies on a certain output format for split. '''
-    s = Spawn('split --verbose -b %s %s %s' % \
-                  (options.chunksize, options.filename, options.chunk_base_name))
+class Splitter(threading.Thread):
+    ''' threaded class for splitting a file into chunks '''
+    def __init__(self, DB, options):
+        threading.Thread.__init__(self)
+        self.DB = DB
+        self.options = options
+        self.s = None
 
-    try:
-        curname = s.readline().split()[2].strip("`'")
-    except Exception:
-        # if file is too small to split
-        curname = options.chunk_base_name + 'a'
-        shutil.copy(options.filename, curname)
-    while curname and not flag.isSet():
+    def run(self):
+        options = self.options; DB = self.DB
+        self.s = Spawn('split --verbose -b %s %s %s' % ( \
+                options.chunksize, options.filename, options.chunk_base_name))
+
         try:
-            prevname = s.readline().split()[2].strip("`'")
+            curname = self.s.readline().split()[2].strip("`'")
         except Exception:
-            #print 'err split', sys.exc_info()[1]
-            prevname = None
-        DB.roothost.chunks_owned.append(Chunk(curname))
-        DB.chunkCount += 1
-        DB.update_chunks_needed()
-        curname = prevname
+            # if file is too small to split
+            curname = options.chunk_base_name + 'a'
+            shutil.copy(options.filename, curname)
+        while curname:
+            try:
+                prevname = self.s.readline().split()[2].strip("`'")
+            except Exception:
+                #print 'err split', sys.exc_info()[1]
+                prevname = None
+            DB.roothost.chunks_owned.append(Chunk(curname))
+            DB.chunkCount += 1
+            DB.update_chunks_needed()
+            curname = prevname
 
-    if flag.isSet():
+        print 'split complete!'
+        DB.split_complete = True
+
+    def kill(self):
         # exiting early, kill the split process
         try:
-            os.kill(s.pid, 9)
+            os.kill(self.s.pid, 9)
         except Exception:
             pass
-
-    print 'split complete!'
-    DB.split_complete = True
-
+        
 
 def main():
     # init defaults
@@ -776,9 +791,7 @@ def main():
         sys.exit(0)
 
     # split the file to transfer. chunk_base_name is the prefix for chunk names
-    splitflag = threading.Event()
-    split_thread = \
-        threading.Thread(target=split_file, args=(DB, options, splitflag))
+    split_thread = Splitter(DB, options)
     split_thread.daemon = True
     split_thread.start()
 
@@ -797,11 +810,13 @@ def main():
         initiateTransfers(DB, threadsema, options, logger, threadlist, commandq)
         print '%d transfers complete' % (DB.hosts_with_file - 1)
     except KeyboardInterrupt:
-        splitflag.set() # have split_file() exit, kill split process
+        #splitflag.set() # have split_file() exit, kill split process
+        split_thread.kill()
         commandq.killall() # stop current processes (calls to cat)
         print '[!] aborted transfers'
     except Exception:
-        splitflag.set()
+        #splitflag.set()
+        split_thread.kill()
         commandq.killall()
         print 'ERROR: initiateTransfers() ', sys.exc_info()[1]
 
@@ -809,7 +824,7 @@ def main():
     while threadlist != [] and split_thread.isAlive():
         time.sleep(0.5)
 
-    # must wait for cat processes to finish
+    # must wait for cat processes to finish before removing chunks
     if options.cleanup is True:
         print 'removing chunks ...'
         commandq.wait_for_procs()
@@ -831,6 +846,7 @@ def main():
 if __name__ == '__main__':
     try:
         main()
+        print 'active thread count:', threading.activeCount()
         print 'done'
     except SystemExit:
         pass
