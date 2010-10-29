@@ -10,7 +10,8 @@ How this differs from scpTsunami.py:
 This version will initiate transfers before split is finished.
 DB.update_chunks_needed() allows this. Also, random insertion of new chunks
 Chunks are catted as soon as a host has them all. rm called after cats for all
-hosts are done.
+  hosts are done.
+Added better ctrl-c behavior
 
 ================================================================================
 The MIT License
@@ -84,7 +85,7 @@ ABOUT
     and use rsync to keep the chunks updated. This is nice if the transfers
     get interrupted and you need to restart the process.
 
-    See HELP below or run './scpTsunami -h' to see available options.
+    See _help() below or run './scpTsunami -h' to see available options.
   
     
 ================================================================================
@@ -95,23 +96,15 @@ still need to implement:
        maximum consecutive transfer failures.
 
 Ideas for Performance
-  - choosing a chunk. choose most rare, can we make them all
-    equally available?
   - best chunk size? less than 20M seems much slower. ideal
     appears to be around 25 - 60M
   - playing around with max_transfers_per_host to maximize bandwidth.
   - have hosts favor certain chunks to keep them in memory
-  - use rcp instead of scp (no encryption). seems much faster, at
-    least for one transfer.
-  - start 'cat'ing chunks as soon as they are all received?
-    The 'cat'ing should take as long as the slowest one
-    since they are done in parallel, may not be worth the complexity.
-    Might benefit if host count > max threads
-  - avoid retransmission of chunks, say if you interrupt the script. This
-    would require disabling of the 'clean up' routine at the end. Could
-    use rsync to accomplish this. Also, could check if complete file
-    already exists on the target and not run cat. Just set host's
-    chunks needed list to empty like the root node.
+  - could check if complete file already exists on the target and not transfer to
+    that host. Could still use as a seed, though.
+  - random seed, chunk selection
+    right now, random seed is selected in getTransfer() and chunk list is
+    created randomly. could make it random chunk selection, maybe.
 
 To Fix
   1. output from 'split' not consistent on some machines 
@@ -125,8 +118,8 @@ Issues
    Not sure what threads receive the signal.
 
 updates
-  9-22
-  transfers start before split has completed
+  10-29 : not running commands through shell anymore since a shell is
+          already opened on the remote host by ssh.
   
 '''
 
@@ -134,6 +127,7 @@ import os
 import sys
 import pty
 import time
+import shlex
 import Queue
 import random
 import shutil
@@ -158,7 +152,6 @@ RM_CMD_TEMPLATE = "ssh -o StrictHostKeyChecking=no %s 'rm -f %s*'"
 RSYNC_CMD_TEMPLATE = 'ssh -o StrictHostKeyChecking=no %s rsync -c %s %s:%s'
 
 CHUNK_SIZE = '40m'
-LOGGING_ENABLED = False
 LOG_FILE = 'scpTsunami.log'
 VERBOSE_OUTPUT_ENABLED = False
 MAX_FAILCOUNT = 3 # maximum consecutive connection failures allowed per host
@@ -234,12 +227,12 @@ class Spawn:
 
 class Options:
     ''' Container class for some options to make passing them simple '''
-    def __init__(self, logging_enabled=LOGGING_ENABLED, chunksize=CHUNK_SIZE, \
+    def __init__(self, chunksize=CHUNK_SIZE, \
                      verbose_output_enabled=VERBOSE_OUTPUT_ENABLED, \
                      cp_cmd_template=SCP_CMD_TEMPLATE, \
                      rm_cmd_template=RM_CMD_TEMPLATE, \
                      cat_cmd_template=CAT_CMD_TEMPLATE):
-        self.logging = logging_enabled
+        self.logger = None
         self.verbose = verbose_output_enabled
         self.username = ''
         self.filename = None      
@@ -253,10 +246,11 @@ class Options:
 
 
 class Logger:
-    ''' Class for providing a log file of the transfers with -s switch '''
-    def __init__(self, filename):
-        self.filename = filename
-        self.starttime = None
+    ''' Class for creating a log file of the transfers with -s switch.
+    Should handle case where script aborts. Could write all log data at
+    once when done() is called, or catch the early exit and write it.'''
+    def __init__(self):
+        self.fptr = self.filename = self.starttime = None
         self.completed_transfers = 0
         self.lock = threading.Lock()
 
@@ -279,9 +273,9 @@ class Logger:
 
 
 class CommandQueue(threading.Thread):
-    ''' a threaded queue class for running rm and cat commands. Instead of 
-    having a thread for each subprocess, this single thread will create 
-    multiple processes. 
+    ''' a threaded queue class for running rm and cat commands. Instead of
+    having a thread for each subprocess, this single thread will create
+    multiple processes.
 
     Do we need to run through shell?
     '''
@@ -301,7 +295,7 @@ class CommandQueue(threading.Thread):
                     if not self.free():
                         time.sleep(0.5)
                 # we have a cmd and a semaphore slot, run the cmd
-                proc = Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT)
+                proc = Popen(shlex.split(cmd), stdout=PIPE, stderr=STDOUT)
                 self.procs.append(proc)
             except Queue.Empty:
                 if self.flag.isSet():
@@ -394,8 +388,8 @@ class Host:
 
     def isAlive(self):
         ''' Called if a transfer fails to see if the host is up '''
-        proc = Popen('ssh -o StrictHostKeyChecking=no %s exit' % \
-                         (self.user+self.hostname), shell=True)
+        proc = Popen(['ssh', '-o', 'StrictHostKeyChecking=no', self.user + \
+                          self.hostname, 'exit'])
         ret = proc.wait() # 0 means alive
         return not ret
 
@@ -406,7 +400,7 @@ class Host:
         if self.alive:
             self.alive = False
             self.DB.incDeadHosts()
-            self.transferslots = 0
+            self.transferslots = 0 # prevents selection for transfers
         self.lock.release()
 
 
@@ -450,8 +444,7 @@ class Database:
             # choose a target
             self.tindex = (self.tindex+1) % self.hostcount
             # check if chosen target is alive and has an open slot
-            if self.hostlist[self.tindex].transferslots > 0 and \
-                    self.hostlist[self.tindex].alive is True: 
+            if self.hostlist[self.tindex].transferslots > 0:
                 # transfer first chunk needed we find
                 for chunk in self.hostlist[self.tindex].chunks_needed:
                     # now, find a seed with the needed chunk
@@ -459,7 +452,7 @@ class Database:
                     # random seed choice
                     sindex = random.randint(0, self.hostcount)
                     # or fixed first seed
-                    #sindex = self.tindex
+                    # sindex = self.tindex
                     for i in xrange(self.hostcount):
                         # +/- 1 may affect some things
                         sindex = (sindex - 1) % self.hostcount
@@ -488,12 +481,12 @@ class Database:
                 # want to randomize order of chunks in list
                 #random.shuffle(host.chunks_needed) # method 3
                 host.chunk_index += len(new_chunks)
-        
+
 
 class Transfer(threading.Thread):
     ''' This class handles the subprocess creation for calls to rcp/scp'''
     def __init__(self, DB, seedindex, chunk, targetindex, threadlist, \
-                     threadsema, options, logger, commandq):
+                     threadsema, options, commandq):
         threading.Thread.__init__(self)
         self.DB = DB
         self.seedindex = seedindex
@@ -502,7 +495,7 @@ class Transfer(threading.Thread):
         self.threadlist = threadlist
         self.threadsema = threadsema
         self.options = options
-        self.logger = logger
+        self.logger = options.logger
         self.commandq = commandq
 
         # might need to tweak this a little more
@@ -516,13 +509,18 @@ class Transfer(threading.Thread):
         seed = self.DB.hostlist[self.seedindex]
 
         try:
-            proc = Popen(self.cp_cmd, shell=True, stdout=PIPE, stderr=PIPE)
+            #proc = Popen(self.cp_cmd, shell=True, stdout=PIPE, stderr=PIPE)
+            proc = Popen(self.cp_cmd.split(), stdout=PIPE, stderr=PIPE)
             stdout, stderr = proc.communicate()
             ret = proc.wait()
 
             if ret == 0:
+                if target.failcount > 0:
+                    target.resetFailCount()
+                if seed.failcount > 0:
+                    seed.resetFailCount()
                 # transfer succeeded
-                if False:#self.options.verbose:
+                if self.options.verbose:
                     print '%s(%d) -> %s(%d) : (%s) success' % \
                         (seed.hostname, seed.transferslots, target.hostname, \
                              target.transferslots, self.chunk.filename)
@@ -532,7 +530,7 @@ class Transfer(threading.Thread):
                         self.DB.chunkCount:
                     # target host has all the chunks
                     self.DB.hostDone()
-                    if self.options.logging:
+                    if self.logger:
                         self.logger.add()
                     # cat the chunks
                     catCmd = self.options.cat_cmd_template % \
@@ -544,13 +542,12 @@ class Transfer(threading.Thread):
                 # transfer failed?
                 if self.chunk not in target.chunks_needed:
                     target.chunks_needed.append(self.chunk)
-                if self.options.verbose:
+                if False:#self.options.verbose:
                     print '%s(%d) -> %s(%d) : (%s) failed' % \
-                        (seed.hostname, seed.transferslots, \
-                             target.hostname, target.transferslots, \
-                             self.chunk.filename)
+                        (seed.hostname, seed.transferslots, target.hostname, \
+                             target.transferslots, self.chunk.filename)
                     print stderr,
-                # check if host is up and accepting ssh connections
+                # check if hosts are up and accepting ssh connections
                 if not target.isAlive():
                     target.setDead()
                 elif not seed.isAlive():
@@ -576,7 +573,7 @@ class Transfer(threading.Thread):
 
 ### END class definitions ###
 
-def initiateTransfers(DB, threadsema, options, logger, threadlist, commandq):
+def initiateTransfers(DB, threadsema, options, threadlist, commandq):
     ''' Returns once all chunks have been transferred to available hosts '''
 
     # loop until every available host has the entire file
@@ -585,13 +582,19 @@ def initiateTransfers(DB, threadsema, options, logger, threadlist, commandq):
         if chunk:
             # begin the transfer
             threadsema.acquire()
-            DB.hostlist[targetindex].chunks_needed.remove(chunk)
-            transferThread = Transfer( \
-                DB, seedindex, chunk, targetindex, threadlist, threadsema, \
-                    options, logger, commandq)
-            threadlist.append(transferThread)
-            transferThread.daemon = True
-            transferThread.start()
+            transferThread = None
+            try:
+                transferThread = Transfer( \
+                    DB, seedindex, chunk, targetindex, threadlist, threadsema, \
+                        options, commandq)
+                threadlist.append(transferThread)
+                transferThread.daemon = True
+                transferThread.start()
+                DB.hostlist[targetindex].chunks_needed.remove(chunk)
+            except Exception:
+                threadsema.release()
+                if transferThread in threadlist:
+                    threadlist.remove(transferThread)
         else:
             # having sleep prevents repeated failed calls to DB.getTransfer()
             # but the sleep() may also slow it down..
@@ -664,15 +667,15 @@ def main():
             if opt in ('-h', '--help'):
                 _usage()
                 _help()
-                sys.exit(0)
+                sys.exit(1)
     except Exception:
-        print 'ERROR: options: ', sys.exc_info()[1]
-        sys.exit(1)
+        print 'ERROR: options', sys.exc_info()[1]
+        sys.exit(2)
 
     if len(args) < 2:
         print 'ERROR: 2 args required'
         _usage()
-        sys.exit(1)
+        sys.exit(2)
 
     # get name of file to transfer
     try:
@@ -684,12 +687,12 @@ def main():
             filepath = os.path.abspath(options.filename)
             if not os.path.isfile(filepath):
                 print 'ERROR: %s not found' % filepath
-                sys.exit(1)
+                sys.exit(2)
             options.filedest = args[1]
     except Exception:
         print 'ERROR: %s' % sys.exc_info()[1]
         _usage()
-        sys.exit(1)
+        sys.exit(2)
 
 
     # parse the command line
@@ -701,7 +704,7 @@ def main():
                 hostfile = open(arg, 'r')
             except Exception:
                 print 'ERROR: Failed to open hosts file:', arg
-                sys.exit(1)
+                sys.exit(2)
             for host in hostfile.readlines():
                 targetlist.append(host.split('\n')[0].strip())
             hostfile.close()
@@ -724,7 +727,7 @@ def main():
                 print 'ERROR: Invalid argument for -r:', arg
                 print sys.exc_info()[1]
                 _usage()
-                sys.exit(1)
+                sys.exit(2)
         elif opt == '-l':
             # read quoted list of comma separated hosts from command line
             hostlist = arg.split()
@@ -735,7 +738,7 @@ def main():
         elif opt == '-u': # username
             options.username = arg + '@'
         elif opt == '-s': # log transfer statistics
-            options.logging = True
+            options.logger = Logger()
         elif opt == '-v': # verbose output
             options.verbose = True
         elif opt == '-t': # transfers per host
@@ -800,14 +803,13 @@ def main():
     threadlist = []
 
     ##### Initiate the transfers #####
-    logger = None
-    if options.logging:
-        logger = Logger(logfile)
-        logger.start()
+    if options.logger:
+        options.logger.filename = logfile
+        options.logger.start()
     print 'transferring %s to %d hosts ...' %(options.filename, len(targetlist))
     try:
         # returns once transfers are complete
-        initiateTransfers(DB, threadsema, options, logger, threadlist, commandq)
+        initiateTransfers(DB, threadsema, options, threadlist, commandq)
         print '%d transfers complete' % (DB.hosts_with_file - 1)
     except KeyboardInterrupt:
         #splitflag.set() # have split_file() exit, kill split process
@@ -839,8 +841,8 @@ def main():
         time.sleep(0.5)
 
     # terminate the log file
-    if options.logging:
-        logger.done()
+    if options.logger:
+        options.logger.done()
 
 
 if __name__ == '__main__':
