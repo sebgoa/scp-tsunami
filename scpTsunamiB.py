@@ -137,7 +137,7 @@ from socket import gethostname
 from subprocess import Popen, PIPE, STDOUT
 
 ### global data ###
-MAX_TRANSFERS_PER_HOST = 6
+MAX_TRANSFERS_PER_HOST = 4
 # most threads will be running a subprocess for scp, so limits the number of
 #  concurrent transfers.
 MAX_THREADS = 250
@@ -391,7 +391,7 @@ class Host:
         proc = Popen(['ssh', '-o', 'StrictHostKeyChecking=no', self.user + \
                           self.hostname, 'exit'])
         ret = proc.wait() # 0 means alive
-        return not ret
+        return ret == 0
 
     def setDead(self):
         ''' If isAlive() failed and host is down, call this to 
@@ -400,7 +400,7 @@ class Host:
         if self.alive:
             self.alive = False
             self.DB.incDeadHosts()
-            self.transferslots = 0 # prevents selection for transfers
+            self.transferslots = 0
         self.lock.release()
 
 
@@ -444,7 +444,8 @@ class Database:
             # choose a target
             self.tindex = (self.tindex+1) % self.hostcount
             # check if chosen target is alive and has an open slot
-            if self.hostlist[self.tindex].transferslots > 0:
+            if self.hostlist[self.tindex].transferslots > 0 and \
+                    self.hostlist[self.tindex].alive is True:
                 # transfer first chunk needed we find
                 for chunk in self.hostlist[self.tindex].chunks_needed:
                     # now, find a seed with the needed chunk
@@ -520,7 +521,7 @@ class Transfer(threading.Thread):
                 if seed.failcount > 0:
                     seed.resetFailCount()
                 # transfer succeeded
-                if self.options.verbose:
+                if False:#self.options.verbose:
                     print '%s(%d) -> %s(%d) : (%s) success' % \
                         (seed.hostname, seed.transferslots, target.hostname, \
                              target.transferslots, self.chunk.filename)
@@ -542,7 +543,7 @@ class Transfer(threading.Thread):
                 # transfer failed?
                 if self.chunk not in target.chunks_needed:
                     target.chunks_needed.append(self.chunk)
-                if False:#self.options.verbose:
+                if self.options.verbose:
                     print '%s(%d) -> %s(%d) : (%s) failed' % \
                         (seed.hostname, seed.transferslots, target.hostname, \
                              target.transferslots, self.chunk.filename)
@@ -806,6 +807,14 @@ def main():
     if options.logger:
         options.logger.filename = logfile
         options.logger.start()
+
+    # print info
+    if options.verbose:
+        print 'max_transfers_per_host =', max_transfers_per_host
+        print 'max_threads =', max_threads
+        print 'max_procs =', max_procs
+        print 'chunksize =', options.chunksize
+
     print 'transferring %s to %d hosts ...' %(options.filename, len(targetlist))
     try:
         # returns once transfers are complete
