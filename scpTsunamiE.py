@@ -119,6 +119,9 @@ Issues
 5. puts file on root host, too?
 6. ctrl-c behavior is iffy. If user hits ctrl-c, no new transfers will begin.
    Not sure what threads receive the signal.
+**NEW**
+7. cpq and commandq are not exiting
+8. starts 4 scp transfers, but that's it
 
 updates
   10-29 : not running commands through shell anymore since a shell is
@@ -158,7 +161,7 @@ CHUNK_SIZE = '40m'
 LOG_FILE = 'scpTsunami.log'
 VERBOSE_OUTPUT_ENABLED = False
 MAX_FAILCOUNT = 3 # maximum consecutive connection failures allowed per host
-CHUNK_DIR = '/local_scratch' # where to put chunks
+CHUNK_DIR = '/tmp' # where to put chunks
 
 def _usage():
     print '''
@@ -305,6 +308,7 @@ class CommandQueue(threading.Thread):
                     break
         # out of loop, wait for running procs
         self.wait_for_procs()
+        print 'CommandQueue done'
 
     def free(self):
         ''' try to free a sema slot '''
@@ -335,7 +339,7 @@ class CommandQueue(threading.Thread):
 
     def killall(self):
         ''' stop creation of new processes and kill those that are active '''
-        #empty the queue
+        # empty the queue and kill current procs
         try:
             while True:
                 self.cmdq.get_nowait()
@@ -348,16 +352,23 @@ class CommandQueue(threading.Thread):
                 pass
 
 
-def CpCommandQueue(CommandQueue):
-    ''' transfer queue '''
-    def __init__(self, DB, options):
-        CommandQueue.__init__(self)
+class CpCommandQueue(CommandQueue):
+    ''' runs commands and has class Poll() deal with the output '''
+    def __init__(self, DB, options, procsema, commandq, procs):
+        CommandQueue.__init__(self, procsema)
         self.DB = DB
         self.options = options
-        self.q = Queue.Queue()
-    
+        self.abortflag = threading.Event()
+        self.procs = procs
+        
+    def kill(self):
+        self.killall()
+        self.abortflag.set()
+
     def run(self):
-        while True:
+        ''' run queued commands forever '''
+        while not self.abortflag.isSet():
+            print 'cpq alive'
             try:
                 cmd, seed, target, chunk = self.cmdq.get(timeout=0.5)
                 while self.procsema.acquire(blocking=False) == False:
@@ -365,13 +376,115 @@ def CpCommandQueue(CommandQueue):
                     if not self.free():
                         time.sleep(0.5)
                 # we have a cmd and a semaphore slot, run the cmd
-                proc = Popen(shlex.split(cmd), stdout=PIPE, stderr=STDOUT)
+                proc = Popen(shlex.split(cmd), stdout=PIPE, stderr=PIPE)
                 self.procs.append((proc, seed, target, chunk))
+                print 'started scp'
             except Queue.Empty:
                 if self.flag.isSet():
                     break
         # out of loop, wait for running procs
-        self.wait_for_procs()        
+        if not self.abortflag.set():
+            self.wait_for_procs()
+        print 'CpCommandQueue done'
+
+    def wait_for_procs(self):
+        ''' self.poll will remove procs from self.procs as they complete '''
+        while self.procs != []:
+            time.sleep(0.5)
+
+
+class Poll(threading.Thread):
+    ''' threaded class for dealing with scp process output.
+    instantiated by CpCommandQueue class ONLY '''
+    def __init__(self, procs, procsema, DB, options, commandq):
+        threading.Thread.__init__(self)
+        self.procs = procs
+        self.procsema = procsema
+        self.DB = DB
+        self.options = options
+        self.commandq = commandq
+        self.logger = options.logger
+        self.flag = threading.Event()
+
+    def kill(self):
+        self.flag.set()
+
+    def run(self):
+        while not self.flag.isSet():
+            active_procs = []
+            for proc, seed, target, chunk in self.procs:
+                ret = proc.poll()
+                if ret is not None:
+                    # getting error here
+                    stdout, stderr = proc.communicate()
+                    # process is done
+                    self.handle_output(ret, stdout, stderr, proc, seed, \
+                                           target, chunk)
+                    self.procsema.release()
+                else:
+                    # process is still active
+                    active_procs.append((proc, seed, target, chunk))
+            #self.procs = active_procs
+            map(self.procs.append, (p for p in active_procs))
+            time.sleep(0.5)
+        print 'Poll done'
+
+    def handle_output(self, ret, stdout, stderr, proc, seed, target, chunk):
+        # interpret output from scp command, success or failure?
+        try:
+            print 'ret ', ret
+            if ret == 0:
+                if target.failcount > 0:
+                    target.resetFailCount()
+                if seed.failcount > 0:
+                    seed.resetFailCount()
+                # transfer succeeded
+                if self.options.verbose:
+                    print '%s(%d) -> %s(%d) : (%s) success' % \
+                        (seed.hostname, seed.transferslots, target.hostname, \
+                             target.transferslots, chunk.filename)
+                target.chunks_owned.append(chunk)
+                # check if target has all the chunks
+                if self.DB.split_complete and len(target.chunks_owned) == \
+                        self.DB.chunkCount:
+                    # target host has all the chunks
+                    self.DB.hostDone()
+                    if self.logger:
+                        self.logger.add()
+                    # cat the chunks
+                    catCmd = self.options.cat_cmd_template % \
+                        (self.options.username+target.hostname, \
+                             self.options.chunk_base_name, self.options.filedest)
+                    self.commandq.put(catCmd)
+            else:
+                # transfer failed?
+                if chunk not in target.chunks_needed:
+                    target.chunks_needed.append(chunk)
+                if self.options.verbose:
+                    print '%s(%d) -> %s(%d) : (%s) failed' % \
+                        (seed.hostname, seed.transferslots, target.hostname, \
+                             target.transferslots, chunk.filename)
+                    print stderr,
+                # check if hosts are up and accepting ssh connections
+                if not target.isAlive():
+                    target.setDead()
+                elif not seed.isAlive():
+                    seed.setDead()
+                elif target.incFailCount():
+                    # no guarantee that target is at fault but this works...
+                    target.setDead()
+
+        except KeyboardInterrupt:
+            pass
+        except Exception:
+            # failed to start transfer?
+            if chunk not in target.chunks_needed:
+                target.chunks_needed.append(chunk)
+            print 'ERROR Poll.handle_output: ', sys.exc_info()[1]
+
+        # free up transfer slots on the seed and target
+        target.freeSlot()
+        seed.freeSlot()
 
 
 class Host:
@@ -512,94 +625,6 @@ class Database:
                 host.chunk_index += len(new_chunks)
 
 
-class Transfer(threading.Thread):
-    ''' This class handles the subprocess creation for calls to rcp/scp'''
-    def __init__(self, DB, seedindex, chunk, targetindex, threadlist, \
-                     threadsema, options, commandq):
-        threading.Thread.__init__(self)
-        self.DB = DB
-        self.seedindex = seedindex
-        self.chunk = chunk
-        self.targetindex = targetindex
-        self.threadlist = threadlist
-        self.threadsema = threadsema
-        self.options = options
-        self.logger = options.logger
-        self.commandq = commandq
-
-        # might need to tweak this a little more
-        self.cp_cmd = options.cp_cmd_template % \
-            (options.username+DB.hostlist[seedindex].hostname, chunk.filename, \
-                 options.username + DB.hostlist[targetindex].hostname, \
-                 chunk.filename)
-
-    def run(self):
-        target = self.DB.hostlist[self.targetindex]
-        seed = self.DB.hostlist[self.seedindex]
-
-        try:
-            #proc = Popen(self.cp_cmd, shell=True, stdout=PIPE, stderr=PIPE)
-            proc = Popen(self.cp_cmd.split(), stdout=PIPE, stderr=PIPE)
-            stdout, stderr = proc.communicate()
-            ret = proc.wait()
-
-            if ret == 0:
-                if target.failcount > 0:
-                    target.resetFailCount()
-                if seed.failcount > 0:
-                    seed.resetFailCount()
-                # transfer succeeded
-                if self.options.verbose:
-                    print '%s(%d) -> %s(%d) : (%s) success' % \
-                        (seed.hostname, seed.transferslots, target.hostname, \
-                             target.transferslots, self.chunk.filename)
-                target.chunks_owned.append(self.chunk)
-                # check if target has all the chunks
-                if self.DB.split_complete and len(target.chunks_owned) == \
-                        self.DB.chunkCount:
-                    # target host has all the chunks
-                    self.DB.hostDone()
-                    if self.logger:
-                        self.logger.add()
-                    # cat the chunks
-                    catCmd = self.options.cat_cmd_template % \
-                        (self.options.username+target.hostname, \
-                             self.options.chunk_base_name, self.options.filedest)
-                    self.commandq.put(catCmd)
-            else:
-                # transfer failed?
-                if self.chunk not in target.chunks_needed:
-                    target.chunks_needed.append(self.chunk)
-                if False:#self.options.verbose:
-                    print '%s(%d) -> %s(%d) : (%s) failed' % \
-                        (seed.hostname, seed.transferslots, target.hostname, \
-                             target.transferslots, self.chunk.filename)
-                    print stderr,
-                # check if hosts are up and accepting ssh connections
-                if not target.isAlive():
-                    target.setDead()
-                elif not seed.isAlive():
-                    seed.setDead()
-                elif target.incFailCount():
-                    # no guarantee that target is at fault but this works...
-                    target.setDead()
-
-
-        except KeyboardInterrupt:
-            pass
-        except Exception:
-            # failed to start transfer?
-            if self.chunk not in target.chunks_needed:
-                target.chunks_needed.append(self.chunk)
-            print 'ERROR Transfer.run: ', sys.exc_info()[1]
-
-        # free up transfer slots on the seed and target
-        target.freeSlot()
-        seed.freeSlot()
-        self.threadlist.remove(self)
-        self.threadsema.release()
-
-
 ### END class definitions ###
 
 def initiateTransfers(DB, options, commandq, cpq):
@@ -626,9 +651,8 @@ def initiateTransfers(DB, options, commandq, cpq):
             # but the sleep() may also slow it down..
             time.sleep(0.2)
 
-    # wait for transfers to complete before returning
-    while threadlist != []:
-        time.sleep(0.5)
+    # i was waiting HERE for transfer procs to finish but they already should
+    #  be done at this point, I think.
 
 
 class Splitter(threading.Thread):
@@ -799,13 +823,27 @@ def main():
     options.chunk_base_name = \
         os.path.join(chunkdir, os.path.split(options.filename)[-1])+ '.chunk_'
 
-    # initialize the background command queue thread
+    # create semaphore to limit processc creation
     procsema = threading.Semaphore(max_procs)
+
+    # list of threads
+    threads = []
+
+    # initialize the background command queue thread
     commandq = CommandQueue(procsema)
+    threads.append(commandq)
     commandq.daemon = True
     commandq.start()
 
-    cpq = CpCommandQueue(procsema)
+    # create thread for dealing with transfer processes
+    scp_procs = []
+    poll = Poll(scp_procs, procsema, DB, options, commandq)
+    poll.daemon = True
+    poll.start()
+
+    # init thread for queueing scp transfers
+    cpq = CpCommandQueue(DB, options, procsema, commandq, scp_procs)
+    threads.append(cpq)
     cpq.daemon = True
     cpq.start()
 
@@ -822,8 +860,9 @@ def main():
         print 'done'
         sys.exit(0)
 
-    # split the file to transfer. chunk_base_name is the prefix for chunk names
+    # split the file to transfe in a separate thread
     split_thread = Splitter(DB, options)
+    threads.append(split_thread)
     split_thread.daemon = True
     split_thread.start()
 
@@ -837,24 +876,29 @@ def main():
         initiateTransfers(DB, options, commandq, cpq)
         print '%d transfers complete' % (DB.hosts_with_file - 1)
     except KeyboardInterrupt:
-        #splitflag.set() # have split_file() exit, kill split process
+        # kill split, cpq, and poll threads
         split_thread.kill()
         commandq.killall() # stop current processes (calls to cat)
+        cpq.kill() # kill cpq thread
+        poll.kill()
         print '[!] aborted transfers'
     except Exception:
         #splitflag.set()
         split_thread.kill()
         commandq.killall()
+        cpq.kill()
+        poll.kill()
         print 'ERROR: initiateTransfers() ', sys.exc_info()[1]
 
     # in case transfers were interrupted, let threads finish execution.
-    while threadlist != [] and split_thread.isAlive():
+    ## may need to modify this
+    while split_thread.isAlive() or cpq.isAlive():
         time.sleep(0.5)
 
     # must wait for cat processes to finish before removing chunks
     if options.cleanup is True:
         print 'removing chunks ...'
-        commandq.wait_for_procs()
+        commandq.wait_for_procs() # wait for calls to cat to finish
         for host in DB.hostlist:
             rmCmd = rm_cmd_template % \
                 (options.username+host.hostname, options.chunk_base_name)
@@ -879,6 +923,8 @@ if __name__ == '__main__':
         pass
     except KeyboardInterrupt:
         print '[!] aborted'
+        os._exit(1)
     except Exception:
         print 'ERROR: main() ', sys.exc_info()[1]
         print 'exiting ...'
+        os._exit(1)

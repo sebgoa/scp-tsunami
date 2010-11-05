@@ -106,10 +106,11 @@ Ideas for Performance
     right now, random seed is selected in getTransfer() and chunk list is
     created randomly. could make it random chunk selection, maybe.
 
-To Fix
+To do
   1. output from 'split' not consistent on some machines 
      Getting index error with attempting to split the output lines.
   2. transferring really small files - fixed?
+  3. asynch calls to scp instead of thread for each
 
 Issues
 2. multiple versions of rcp on some machines, having trouble using it.
@@ -821,12 +822,10 @@ def main():
         initiateTransfers(DB, threadsema, options, threadlist, commandq)
         print '%d transfers complete' % (DB.hosts_with_file - 1)
     except KeyboardInterrupt:
-        #splitflag.set() # have split_file() exit, kill split process
-        split_thread.kill()
+        split_thread.kill() # stop splitting the file
         commandq.killall() # stop current processes (calls to cat)
         print '[!] aborted transfers'
     except Exception:
-        #splitflag.set()
         split_thread.kill()
         commandq.killall()
         print 'ERROR: initiateTransfers() ', sys.exc_info()[1]
