@@ -2,7 +2,7 @@ files included in this repository:
 
 scpTsunami.py
 This is the original version of the script, used for measuring improvements
-made in newer versions.
+made in newer versions. Only modifications on this file are to fix bugs.
 
 scpTsunamiA.py
 This is a stable, improved version of scpTsunami.py.
