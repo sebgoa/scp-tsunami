@@ -283,60 +283,64 @@ class Logger:
         self.lock.release()
 
 
-class KillableThread(threading.Thread):
-    ''' Killable thread class for running in the background. '''
-    def __init__(self):
-        threading.Thread.__init__(self)
-        self.finishflag = threading.Event()
-        self.killflag = threading.Event()
-
-    def finish(self):
-        ''' exit gracefully '''
-        self.finishflag.set()
-        
-    def kill(self):
-        ''' exit now and abort work '''
-        self.killflag.set()
-
-
-class CommandQueue(KillableThread):
+class CommandQueue(threading.Thread):
     ''' a threaded queue class for running rm and cat commands. Instead of
     having a thread for each subprocess, this single thread will create
-    multiple processes. The process list must be passed to a CmdPoll
-    instance which will handle take over the processes once they are started.
+    multiple processes. Does not check the output.
     '''
-    def __init__(self, procsema, procs):
-        KillableThread.__init__(self)
+    def __init__(self, procsema):
+        threading.Thread.__init__(self)
         self.cmdq = Queue.Queue()
         self.procsema = procsema
-        self.procs = procs
+        self.flag = threading.Event()
+        self.procs = []
 
     def run(self):
-        ''' start queued processes '''
-        while not self.killflag.isSet():
+        while True:
             try:
                 cmd = self.cmdq.get(timeout=0.5)
                 while self.procsema.acquire(blocking=False) == False:
-                    time.sleep(0.5)
+                    # sema is full, free slots
+                    if not self.free():
+                        time.sleep(0.5)
                 # we have a cmd and a semaphore slot, run the cmd
                 proc = Popen(shlex.split(cmd), stdout=PIPE, stderr=STDOUT)
                 self.procs.append((proc, (cmd,)))
             except Queue.Empty:
-                if self.finishflag.isSet():
+                if self.flag.isSet():
                     break
         # out of loop, wait for running procs
         self.wait_for_procs()
         print 'CommandQueue done'
 
+    def free(self):
+        ''' try to free a sema slot '''
+        activeprocs = []
+        slotfreed = False
+        for proc in self.procs:
+            if proc.poll() is not None: # is proc finished?
+                self.procsema.release() # then open slot
+                slotfreed = True
+            else:
+                activeprocs.append(proc)
+        self.procs = activeprocs
+        # return true if a slot was freed
+        return slotfreed
+
     def wait_for_procs(self):
         ''' wait for procs to finish '''
         while self.procs != []:
-            time.sleep(0.5)
+            if not self.free():
+                time.sleep(0.5)
 
     def put(self, cmd):
         self.cmdq.put(cmd)
 
-    def killprocs(self):
+    def finish(self):
+        ''' empty the queue then quit '''
+        self.flag.set()
+
+    def killall(self):
         ''' stop creation of new processes and kill those that are active '''
         # empty the queue and kill current procs
         try:
@@ -344,7 +348,7 @@ class CommandQueue(KillableThread):
                 self.cmdq.get_nowait()
         except Queue.Empty:
             pass
-        for proc in self.procs[0]:
+        for proc in self.procs:
             try:
                 os.kill(proc.pid, 9)
             except Exception:
@@ -352,17 +356,22 @@ class CommandQueue(KillableThread):
 
 
 class CpCommandQueue(CommandQueue):
-    ''' runs commands and has class CpPoll() deal with the output '''
-    def __init__(self, procsema, procs):
-        CommandQueue.__init__(self, procsema, procs)
+    ''' runs commands and has class Poll() deal with the output '''
+    def __init__(self, DB, options, procsema, commandq, procs):
+        CommandQueue.__init__(self, procsema)
+        self.DB = DB
+        self.options = options
+        self.abortflag = threading.Event()
+        # this list is shared by Poll(), do not reassign!
+        self.procs = procs
         
     def kill(self):
-        self.killprocs()
-        self.killflag.set()
+        self.killall()
+        self.abortflag.set()
 
     def run(self):
         ''' run queued commands forever '''
-        while not self.killflag.isSet():
+        while not self.abortflag.isSet():
             try:
                 cmd, seed, target, chunk = self.cmdq.get(timeout=0.5)
                 while self.procsema.acquire(blocking=False) == False:
@@ -372,10 +381,10 @@ class CpCommandQueue(CommandQueue):
                 proc = Popen(shlex.split(cmd), stdout=PIPE, stderr=PIPE)
                 self.procs.append((proc, (seed, target, chunk)))
             except Queue.Empty:
-                if self.finishflag.isSet():
+                if self.flag.isSet():
                     break
         # out of loop, wait for running procs
-        if not self.killflag.set():
+        if not self.abortflag.set():
             self.wait_for_procs()
         print 'CpCommandQueue done'
 
@@ -385,36 +394,39 @@ class CpCommandQueue(CommandQueue):
             time.sleep(0.5)
 
 
-class CmdPoll(KillableThread):
+class CmdPoll(threading.Thread):
     ''' Threaded class for polling processes in a list. Removes finished
-    processes from the list and handles the output. This class will
-    handle rm and cat processes or other misc ones but not scp.
+    processes from the list and handles the output.
     '''
-    def __init__(self, procsema, procs):
-        KillableThread.__init__(self)
+    def __init__(self, procs, procsema):
+        threading.Thread.__init__(self, procs, procsema)
         self.procs = procs
         self.procsema = procsema
 
-    def handle_output(self, ret, proc, vals):
-        cmd = vals[0]
-        if ret != 0:
-            print 'error: ', cmd
+    def kill(self):
+        self.flag.set()
+
+    def finish(self):
+        ''' exit gracefully '''
+        self.flag.set()
+
+    def handle_output(self, ret, stdout, stderr, vals):
+        pass
 
     def run(self):
-        ''' Poll processes and if they are finished, handle the output '''
-        while not self.killflag.isSet() and not (self.finishflag.isSet() and
-                                                 len(self.procs) == 0):
+        while not self.flag.isSet():
             active_procs = []
             #proc, seed, target, chunk
             for proc, vals in self.procs:
                 ret = proc.poll()
                 if ret is not None:
+                    stdout, stderr = proc.communicate()
                     # process is done
-                    self.handle_output(ret, proc, vals)
+                    self.handle_output(ret, stdout, stderr, vals)
                     self.procsema.release()
                 else:
                     # process is still active
-                    active_procs.append((proc, vals))
+                    active_procs.append((proc, seed, target, chunk))
             # empty process list and insert ONLY active processes
             while len(self.procs) > 0:
                 self.procs.pop()
@@ -426,16 +438,38 @@ class CmdPoll(KillableThread):
 class CpPoll(CmdPoll):
     ''' threaded class for dealing with scp process output.
     '''
-    def __init__(self, procsema, procs, DB, options, commandq):
-        CmdPoll.__init__(self, procsema, procs)
+    def __init__(self, procs, procsema, DB, options, commandq):
+        CmdPoll.__init__(self, procs, procsema)
         self.DB = DB
         self.options = options
         self.commandq = commandq
         self.logger = options.logger
+        self.flag = threading.Event()
 
-    def handle_output(self, ret, proc, vals):
+    def run1(self):
+        while not self.flag.isSet():
+            active_procs = []
+            for proc, seed, target, chunk in self.procs:
+                ret = proc.poll()
+                if ret is not None:
+                    stdout, stderr = proc.communicate()
+                    # process is done
+                    self.handle_output(ret, stdout, stderr, seed, \
+                                           target, chunk)
+                    self.procsema.release()
+                else:
+                    # process is still active
+                    active_procs.append((proc, seed, target, chunk))
+            # empty process list and insert ONLY active processes
+            while len(self.procs) > 0:
+                self.procs.pop()
+            map(self.procs.append, active_procs)
+            time.sleep(0.5)
+        print 'Poll done'
+
+    #def handle_output(self, ret, stdout, stderr, seed, target, chunk):
+    def handle_output(self, ret, stdout, stderr, vals):
         seed, target, chunk = vals
-        stdout, stderr = proc.communicate()
         # interpret output from scp command, success or failure?
         try:
             if ret == 0:
@@ -746,7 +780,7 @@ def main():
 
 
     # parse the command line
-    targetlist = [] # takes host names
+    targetlist = [] # takes Host(hostname) 
     for opt, arg in optlist:
         if opt == '-f': # file
             # read '\n' separated hosts from file
@@ -811,6 +845,9 @@ def main():
         else:
             print 'invalid option: %s' % opt
 
+    for t in targetlist:
+        print t
+    os._exit(0)
 
     # set up a list database of all hosts
     DB = Database()
@@ -830,55 +867,42 @@ def main():
     # create semaphore to limit processc creation
     procsema = threading.Semaphore(max_procs)
 
-    ###### create queue and poll threads ######################################
-    # The queue threads (commandq and cpq) share a process list with a poll
-    #  thread (cmd_poll and cp_poll). The queue threads are fed commands
-    #  to run and then the Popen objects are added to the process list along
-    #  with process data. The poll threads will then poll the processes until
-    #  they finish, at which point the output can be handled.
+    ## create background threads
+    # list of threads
     threads = []
-    #
-    # create a thread for dealing with process output
-    cmd_procs = []
-    cmdp = CmdPoll(procsema, cmd_procs)
-    cmdp.daemon = True
-    threads.append(cmdp)
-    #
+
     # initialize the background command queue thread
-    commandq = CommandQueue(procsema, cmd_procs)
-    commandq.daemon = True
+    commandq = CommandQueue(procsema)
     threads.append(commandq)
-    #
-    # create thread for dealing with transfer process output
+    commandq.daemon = True
+    commandq.start()
+
+    # create thread for dealing with transfer processes
     scp_procs = []
-    cpp = CpPoll(procsema, scp_procs, DB, options, commandq)
-    cpp.daemon = True
-    threads.append(cpp)
-    #
+    poll = CpPoll(scp_procs, procsema, DB, options, commandq)
+    poll.daemon = True
+    poll.start()
+
     # init thread for queueing scp transfers
-    cpq = CpCommandQueue(procsema, scp_procs)
-    cpq.daemon = True
+    cpq = CpCommandQueue(DB, options, procsema, commandq, scp_procs)
     threads.append(cpq)
-    ###########################################################################
+    cpq.daemon = True
+    cpq.start()
 
-    for thread in threads:
-        thread.start()
-
-    # If clean was passed as first argument, remove chunks from all hosts
-    #  and exit.
     if cleanonly is True:
+        # remove chunks from hosts and exit
         print 'removing chunks ...'
         for host in DB.hostlist:
             rmCmd = rm_cmd_template % \
                 (options.username+host.hostname, options.chunk_base_name)
             commandq.put(rmCmd)
         commandq.finish()
-        while commandq.isAlive() or cmdp.isAlive():
+        while commandq.isAlive():
             time.sleep(0.5)
         print 'done'
         sys.exit(0)
 
-    # split the file to transfer in a separate thread
+    # split the file to transfe in a separate thread
     split_thread = Splitter(DB, options)
     threads.append(split_thread)
     split_thread.daemon = True
@@ -894,27 +918,25 @@ def main():
         initiateTransfers(DB, options, commandq, cpq)
         print '%d transfers complete' % (DB.hosts_with_file - 1)
         cpq.finish() # exit gracefully
-        cpp.finish()
+        poll.finish()
     except KeyboardInterrupt:
         # kill split, cpq, and poll threads
         split_thread.kill()
-        commandq.killprocs() # stop current processes (calls to cat)
+        commandq.killall() # stop current processes (calls to cat)
         cpq.kill() # kill cpq thread and scp processes
-        cpp.kill()
-        cmdp.kill()
+        poll.kill()
         print '[!] aborted transfers'
     except Exception:
         split_thread.kill()
-        commandq.killprocs()
+        commandq.killall()
         cpq.kill()
-        cpp.kill()
-        cmdp.kill()
+        poll.kill()
         print 'ERROR: initiateTransfers() ', sys.exc_info()[1]
 
     # in case transfers were interrupted, let threads finish execution.
     ## may need to modify this
     try:
-        while split_thread.isAlive() or cpq.isAlive() or cpp.isAlive():
+        while split_thread.isAlive() or cpq.isAlive() or poll.isAlive():
             time.sleep(0.5)
     except KeyboardInterrupt:
         pass
@@ -943,7 +965,6 @@ if __name__ == '__main__':
         main()
         print 'active thread count:', threading.activeCount()
         print 'done'
-        os._exit(1)
     except SystemExit:
         pass
     except KeyboardInterrupt:
