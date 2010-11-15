@@ -299,6 +299,7 @@ class CommandQueue(threading.Thread):
                 proc = Popen(shlex.split(cmd), stdout=PIPE, stderr=STDOUT)
                 self.procs.append(proc)
             except Queue.Empty:
+                time.sleep(0.5)
                 if self.flag.isSet():
                     break
         # out of loop, wait for running procs
