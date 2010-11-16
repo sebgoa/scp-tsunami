@@ -148,8 +148,8 @@ MAX_PROCS = 500 # each proc will be a call to rm or cat
 SCP_CMD_TEMPLATE = "ssh -o StrictHostKeyChecking=no %s scp -c blowfish \
 -o StrictHostKeyChecking=no %s %s:%s"
 RCP_CMD_TEMPLATE = "ssh -o StrictHostKeyChecking=no %s rcp %s %s:%s"
-CAT_CMD_TEMPLATE = "ssh -o StrictHostKeyChecking=no %s 'cat %s* > %s'"
-RM_CMD_TEMPLATE = "ssh -o StrictHostKeyChecking=no %s 'rm -f %s*'"
+CAT_CMD_TEMPLATE = 'ssh -o StrictHostKeyChecking=no %s "cat %s* > %s"'
+RM_CMD_TEMPLATE = 'ssh -o StrictHostKeyChecking=no %s "rm -f %s*"'
 RSYNC_CMD_TEMPLATE = 'ssh -o StrictHostKeyChecking=no %s rsync -c %s %s:%s'
 
 CHUNK_SIZE = '40m'
@@ -762,6 +762,10 @@ def main():
             print 'invalid option: %s' % opt
 
 
+    if targetlist == []:
+        print 'No targets, exiting ...'
+        sys.exit(1)
+
     # set up a list database of all hosts
     DB = Database()
     DB.hostlist.append(Host(gethostname(), DB, [], options.username, \
@@ -769,13 +773,14 @@ def main():
     DB.roothost = DB.hostlist[0]
     targetlist = set(targetlist) # remove duplicates
     for target in targetlist:
-        DB.hostlist.append(Host(target, DB, [], options.username, \
-                                    max_transfers_per_host))
+        if target != DB.roothost:
+            DB.hostlist.append(Host(target, DB, [], options.username, \
+                                        max_transfers_per_host))
     DB.hostcount = len(DB.hostlist)
 
     # build prefix for file chunk names
     options.chunk_base_name = \
-        os.path.join(chunkdir, os.path.split(options.filename)[-1])+ '.chunk_'
+        os.path.join(chunkdir, os.path.split(options.filedest)[-1])+ '.chunk_'
 
     # initialize the background command queue thread
     procsema = threading.Semaphore(max_procs)

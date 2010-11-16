@@ -13,3 +13,14 @@ stable.
 
 scpTsunamiE.py
 'E' for experimental. This is where new ideas are tested.
+
+E2 vs B2
+E uses asynch scp calls
+B uses threads still
+
+
+changes made in later versions that should be implemented in all:
+1) dicts for Host.chunks_owned
+2) rm_cmd_template, " instead of '?
+3) get target for open slots too!
+4) remove roothost name from targetlist
