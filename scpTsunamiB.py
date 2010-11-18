@@ -1,19 +1,13 @@
 #!/usr/bin/env python
 
 '''
-scpTsunamiB.py - implements commandqueue in version A to reduce number of threads.
+scpTsunamiB.py - adds dictionary chunks_needed and DB.workl
 
-================================================================================
+===============================================================================
 VERSION
 
-How this differs from scpTsunami.py:
-This version will initiate transfers before split is finished.
-DB.update_chunks_needed() allows this. Also, random insertion of new chunks
-Chunks are catted as soon as a host has them all. rm called after cats for all
-  hosts are done.
-Added better ctrl-c behavior
 
-================================================================================
+===============================================================================
 The MIT License
 
 Copyright (c) 2010 Clemson University
@@ -36,19 +30,22 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 
-================================================================================
+===============================================================================
 ABOUT
 
--Brief-
+-----
+Brief
   Python script for distributing large files over a cluster.
 
--Requirements-
+------------
+Requirements
   Unix environment and basic tools (scp, split)
   You will also need to setup ssh keys so you don't have to enter your
     password for every connection.
   You will also need enough disk space (2 times file size).
 
--Summary-
+-------
+Summary
   This script improves upon the previous version (scpWave) by splitting 
   the file to transfer into chunks, similar to bitTorrent. A single host
   starts with the file and splits it into chunks. From there, this initial
@@ -58,15 +55,16 @@ ABOUT
   file as soon as all the chunks are received. Chunks will be removed as
   soon as all calls to 'cat' exit
 
-
--Platform Specific Issues-
+------------------------
+Platform Specific Issues
   1. scpTsunami relies on a certain format for the split command's 
      output. Has created problems on some machines.
   2. I have noticed that some machines have different versions of rcp.
      If you choose to use rcp, modify RCP_CMD_TEMPLATE with the full
      path the the rcp you want to use.
 
--Usage Notes-
+-----------
+Usage Notes
   Example usage to transfer image.zip to hosts listed in a file:
     ./scpTsunami image.zip images/image.zip -f hosts.txt
     This is the most basic usage. There are several options to control the
@@ -77,7 +75,8 @@ ABOUT
       This will remove any chunks created earlier while transferring <file>.
       <file> will be preserved.
 
-  Behavior
+--------
+Behavior
     By default, scp will be used to transfer the files. You can also use rsync
     or rcp. Rsync will only transfer chunks if the file does not already 
     exist on the target host. It does this by comparing the checksums.
@@ -91,10 +90,12 @@ ABOUT
 ================================================================================
 DEVELOPMENT NOTES
 
-still need to implement:
+-----
+To do
   1. what to do if host is up but transfers are still failing? Implement
        maximum consecutive transfer failures.
 
+---------------------
 Ideas for Performance
   - best chunk size? less than 20M seems much slower. ideal
     appears to be around 25 - 60M
@@ -105,23 +106,24 @@ Ideas for Performance
   - random seed, chunk selection
     right now, random seed is selected in getTransfer() and chunk list is
     created randomly. could make it random chunk selection, maybe.
+  - class TransferQueue, similar to CommandQueue but for scp calls.
+    This would reduce the number of threads.
 
-To do
+------
+To Fix
   1. output from 'split' not consistent on some machines 
      Getting index error with attempting to split the output lines.
   2. transferring really small files - fixed?
-  3. asynch calls to scp instead of thread for each
+  3. CommandQueue and CpCommandQueue share same semaphore but CommandQueue
+     is lazy about releasing the semaphore. Have 2 separate semas or have
+     a Poll() for CommandQueue
 
+------
 Issues
-2. multiple versions of rcp on some machines, having trouble using it.
-5. puts file on root host, too?
-6. ctrl-c behavior is iffy. If user hits ctrl-c, no new transfers will begin.
-   Not sure what threads receive the signal.
-
-updates
-  10-29 : not running commands through shell anymore since a shell is
-          already opened on the remote host by ssh.
-  
+1. multiple versions of rcp on some machines, having trouble using it.
+2. heavy CPU usage, it's being plastered. getTransfer() is the likely culprit.
+   Need to find a way to find target,seed,chunk tuples w/o checking all 
+   possibilities.
 '''
 
 import os
@@ -355,7 +357,7 @@ class Host:
         self.hostname = hostname
         self.transferslots = max_transfers_per_host
         self.chunks_needed = chunks_needed
-        self.chunks_owned = []
+        self.chunks_owned = {}
         self.lock = threading.Lock()
         self.alive = True
         self.DB = DB
@@ -424,6 +426,7 @@ class Database:
         self.split_complete = False
         self.deadhosts = 0
         self.roothost = None
+        self.workl = []
 
     def incDeadHosts(self):
         ''' call after setting a Host instance as dead, lets the script
@@ -438,63 +441,51 @@ class Database:
         self.hosts_with_file += 1
         self.lock.release()
 
-    # this version will return an available transfer if one exists
-    def getTransfer(self):
-        ''' Returns (seed, target, chunk) which will be passed to a transfer 
-        thread '''
-        for q in xrange(self.hostcount):
-            # choose a target
-            self.tindex = (self.tindex+1) % self.hostcount
-            # check if chosen target is alive and has an open slot
-            if self.hostlist[self.tindex].transferslots > 0 and \
-                    self.hostlist[self.tindex].alive is True:
-                # transfer first chunk needed we find
-                for chunk in self.hostlist[self.tindex].chunks_needed:
-                    # now, find a seed with the needed chunk
-                    
-                    # random seed choice
-                    sindex = random.randint(0, self.hostcount)
-                    # or fixed first seed
-                    # sindex = self.tindex
-                    for i in xrange(self.hostcount):
-                        # +/- 1 may affect some things
-                        sindex = (sindex - 1) % self.hostcount
-                        if chunk in self.hostlist[sindex].chunks_owned and \
-                                self.hostlist[sindex].transferslots > 0 and \
-                                self.hostlist[sindex].alive is True:
-                            # found a seed
-                            self.hostlist[sindex].getSlot()
-                            self.hostlist[self.tindex].getSlot() # right spot?
-                            return sindex, self.tindex, chunk
-        # couldn't match up a transfer
+    def getTransfer(self): #E2
+        ''' match a target and chunk with a seed '''
+        seed = target = chunk = None
+        for x in range(len(self.workl)):
+            try:
+                target, chunk = self.workl.pop(0)
+                if target.transferslots < 1:
+                    # target is busy, grab another
+                    self.workl.append((target, chunk))
+                    continue
+
+                # now find a seed
+                for host in self.hostlist:
+                    if chunk.filename in host.chunks_owned and \
+                            host.transferslots > 0:
+                        return host, target, chunk
+                # no seeder, put work back on the queue
+                self.workl.append((target, chunk))
+            except IndexError:
+                # workl is empty
+                break
         return None, None, None
 
-    # update chunks_needed list of each host
-    def update_chunks_needed(self):
+    def update_chunks_needed(self, chunkname):
         ''' this method is called from split_file() everytime a new chunk has
         been created. It updates the chunks needed lists of each host '''
+        chunk = Chunk(chunkname)
         for host in self.hostlist:
-            if host == self.roothost: continue # root is updated in split_file()
-            if host.chunk_index < (self.chunkCount):
-                new_chunks = self.roothost.chunks_owned[host.chunk_index:]
-                #host.chunks_needed += new_chunks # method 1
-                for chunk in new_chunks: # method 2
-                    host.chunks_needed.insert( \
-                        random.randint(0, len(host.chunks_needed)+1), chunk)
-                # want to randomize order of chunks in list
-                #random.shuffle(host.chunks_needed) # method 3
-                host.chunk_index += len(new_chunks)
+            if host == self.roothost:
+                continue # root is updated in split_file()
+            host.chunks_needed.insert( \
+                random.randint(0, len(host.chunks_needed)+1), chunk)
+            self.workl.insert( \
+                random.randint(0, len(self.workl) + 1), (host, chunk))
 
 
 class Transfer(threading.Thread):
     ''' This class handles the subprocess creation for calls to rcp/scp'''
-    def __init__(self, DB, seedindex, chunk, targetindex, threadlist, \
+    def __init__(self, DB, seed, chunk, target, threadlist, \
                      threadsema, options, commandq):
         threading.Thread.__init__(self)
         self.DB = DB
-        self.seedindex = seedindex
+        self.seed = seed
         self.chunk = chunk
-        self.targetindex = targetindex
+        self.target = target
         self.threadlist = threadlist
         self.threadsema = threadsema
         self.options = options
@@ -503,13 +494,13 @@ class Transfer(threading.Thread):
 
         # might need to tweak this a little more
         self.cp_cmd = options.cp_cmd_template % \
-            (options.username+DB.hostlist[seedindex].hostname, chunk.filename, \
-                 options.username + DB.hostlist[targetindex].hostname, \
+            (options.username + seed.hostname, chunk.filename, \
+                 options.username + target.hostname, \
                  chunk.filename)
 
     def run(self):
-        target = self.DB.hostlist[self.targetindex]
-        seed = self.DB.hostlist[self.seedindex]
+        target = self.target
+        seed = self.seed
 
         try:
             #proc = Popen(self.cp_cmd, shell=True, stdout=PIPE, stderr=PIPE)
@@ -523,11 +514,11 @@ class Transfer(threading.Thread):
                 if seed.failcount > 0:
                     seed.resetFailCount()
                 # transfer succeeded
-                if False:#self.options.verbose:
+                if self.options.verbose:
                     print '%s(%d) -> %s(%d) : (%s) success' % \
                         (seed.hostname, seed.transferslots, target.hostname, \
                              target.transferslots, self.chunk.filename)
-                target.chunks_owned.append(self.chunk)
+                target.chunks_owned[self.chunk.filename] = None
                 # check if target has all the chunks
                 if self.DB.split_complete and len(target.chunks_owned) == \
                         self.DB.chunkCount:
@@ -540,7 +531,6 @@ class Transfer(threading.Thread):
                         (self.options.username+target.hostname, \
                              self.options.chunk_base_name, self.options.filedest)
                     self.commandq.put(catCmd)
-
             else:
                 # transfer failed?
                 if self.chunk not in target.chunks_needed:
@@ -558,7 +548,6 @@ class Transfer(threading.Thread):
                 elif target.incFailCount():
                     # no guarantee that target is at fault but this works...
                     target.setDead()
-
 
         except KeyboardInterrupt:
             pass
@@ -581,19 +570,21 @@ def initiateTransfers(DB, threadsema, options, threadlist, commandq):
 
     # loop until every available host has the entire file
     while DB.hosts_with_file + DB.deadhosts < DB.hostcount:
-        seedindex, targetindex, chunk = DB.getTransfer()
-        if chunk:
+        seed, target, chunk = DB.getTransfer()
+        if seed:
             # begin the transfer
             threadsema.acquire()
             transferThread = None
             try:
                 transferThread = Transfer( \
-                    DB, seedindex, chunk, targetindex, threadlist, threadsema, \
+                    DB, seed, chunk, target, threadlist, threadsema, \
                         options, commandq)
                 threadlist.append(transferThread)
                 transferThread.daemon = True
                 transferThread.start()
-                DB.hostlist[targetindex].chunks_needed.remove(chunk)
+                target.chunks_needed.remove(chunk)
+                seed.getSlot()
+                target.getSlot()
             except Exception:
                 threadsema.release()
                 if transferThread in threadlist:
@@ -633,9 +624,9 @@ class Splitter(threading.Thread):
             except Exception:
                 #print 'err split', sys.exc_info()[1]
                 prevname = None
-            DB.roothost.chunks_owned.append(Chunk(curname))
+            DB.roothost.chunks_owned[curname] = None
             DB.chunkCount += 1
-            DB.update_chunks_needed()
+            DB.update_chunks_needed(curname)
             curname = prevname
 
         print 'split complete!'
@@ -768,14 +759,17 @@ def main():
 
     # set up a list database of all hosts
     DB = Database()
-    DB.hostlist.append(Host(gethostname(), DB, [], options.username, \
-                                max_transfers_per_host))
-    DB.roothost = DB.hostlist[0]
+    rootname = gethostname()
+    DB.roothost = Host(rootname, DB, [], options.username, \
+                           max_transfers_per_host)
+    DB.hostlist.append(DB.roothost)
+    if rootname in targetlist:
+        targetlist.remove(rootname)
+        
     targetlist = set(targetlist) # remove duplicates
     for target in targetlist:
-        if target != DB.roothost:
-            DB.hostlist.append(Host(target, DB, [], options.username, \
-                                        max_transfers_per_host))
+        DB.hostlist.append(Host(target, DB, [], options.username, \
+                                    max_transfers_per_host))
     DB.hostcount = len(DB.hostlist)
 
     # build prefix for file chunk names

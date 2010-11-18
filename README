@@ -22,5 +22,5 @@ B uses threads still
 changes made in later versions that should be implemented in all:
 1) dicts for Host.chunks_owned
 2) rm_cmd_template, " instead of '?
-3) get target for open slots too!
+3) check target for open slots too!
 4) remove roothost name from targetlist

@@ -1,8 +1,10 @@
 #!/usr/bin/env python
 
 '''
-scpTsunamiE.py - implements commandqueue in version A to reduce number of threads.
+scpTsunamiE2.py - implements commandqueue in version A to reduce number of threads.
 adds command queueing for scp commands, unlike ver B
+
+Ver E2 aims to speed up getTransfer() using dicts for chunks_owned
 
 ===============================================================================
 VERSION
@@ -143,7 +145,7 @@ from subprocess import Popen, PIPE, STDOUT
 ### global data ###
 # maximum number of concurrent transfers per host
 MAX_TRANSFERS_PER_HOST = 6
-MAX_PROCS = 600 # each proc will be a call to scp, rm, or cat, through ssh
+MAX_PROCS = 500 # each proc will be a call to scp, rm, or cat, through ssh
 CHUNK_SIZE = '40m' # see -b option for 'split' utility
 LOG_FILE = 'scpTsunami.log'
 VERBOSE_OUTPUT_ENABLED = False
@@ -153,8 +155,8 @@ MAX_FAILURES = 3 # stop queueing commands for a host after consecutive failures
 SCP_CMD_TEMPLATE = "ssh -o StrictHostKeyChecking=no %s scp -c blowfish \
 -o StrictHostKeyChecking=no %s %s:%s"
 RCP_CMD_TEMPLATE = "ssh -o StrictHostKeyChecking=no %s rcp %s %s:%s"
-CAT_CMD_TEMPLATE = "ssh -o StrictHostKeyChecking=no %s 'cat %s* > %s'"
-RM_CMD_TEMPLATE = "ssh -o StrictHostKeyChecking=no %s 'rm -f %s*'"
+CAT_CMD_TEMPLATE = 'ssh -o StrictHostKeyChecking=no %s "cat %s* > %s"'
+RM_CMD_TEMPLATE = 'ssh -o StrictHostKeyChecking=no %s "rm -f %s*"'
 RSYNC_CMD_TEMPLATE = 'ssh -o StrictHostKeyChecking=no %s rsync -c %s %s:%s'
 
 # remove this code later
@@ -280,7 +282,7 @@ class Logger:
 
     def start(self):
         self.fptr = open(self.filename, 'a')
-        self.fptr.write('start ' + time.ctime() + '\n')
+        self.fptr.write('start %s %s' % (time.ctime(), sys.argv[0]) + '\n')
         self.starttime = time.time()
 
     def done(self):
@@ -333,7 +335,7 @@ class CommandQueue(KillableThread):
             try:
                 if self.procsema.acquire(blocking=False) == False:
                     # at process limit
-                    time.sleep(0.5)
+                    time.sleep(0.2)
                     continue
                 cmd = self.cmdq.get(timeout=0.5)
                 # we have a cmd and a semaphore slot, run the cmd
@@ -342,9 +344,9 @@ class CommandQueue(KillableThread):
             except Queue.Empty:
                 # no work to do
                 self.procsema.release()
-                time.sleep(0.5)
                 if self.finishflag.isSet():
                     break
+                time.sleep(0.2)
         # out of loop, wait for running procs
         self.wait_for_procs()
         print 'CommandQueue done'
@@ -393,7 +395,7 @@ class CpCommandQueue(CommandQueue):
         while not self.killflag.isSet():
             try:
                 if self.procsema.acquire(blocking=False) == False:
-                    time.sleep(0.5)
+                    time.sleep(0.1)
                     continue
                 cmd, seed, target, chunk = self.cmdq.get(timeout=0.5)
                 # we have a cmd and a semaphore slot, run the cmd
@@ -401,7 +403,7 @@ class CpCommandQueue(CommandQueue):
                 self.procs.append((proc, (seed, target, chunk)))
             except Queue.Empty:
                 self.procsema.release()
-                time.sleep(0.5)
+                time.sleep(0.1)
                 if self.finishflag.isSet():
                     break
         # out of loop, wait for running procs
@@ -442,8 +444,8 @@ class CmdPoll(KillableThread):
                 ret = proc.poll()
                 if ret is not None:
                     # process is done
-                    self.handle_output(ret, proc, vals)
                     self.procsema.release()
+                    self.handle_output(ret, proc, vals)
                 else:
                     # process is still active
                     active_procs.append((proc, vals))
@@ -451,7 +453,7 @@ class CmdPoll(KillableThread):
             while len(self.procs) > 0:
                 self.procs.pop()
             map(self.procs.append, active_procs)
-            time.sleep(0.5)
+            time.sleep(0.2)
         print 'Poll done'
 
 
@@ -476,11 +478,11 @@ class CpPoll(CmdPoll):
                 if seed.failcount > 0:
                     seed.resetFailCount()
                 # transfer succeeded
-                if False:#self.options.verbose:
+                if self.options.verbose:
                     print '%s(%d) -> %s(%d) : (%s) success' % \
                         (seed.hostname, seed.transferslots, target.hostname, \
                              target.transferslots, chunk.filename)
-                target.chunks_owned.append(chunk)
+                target.chunks_owned[chunk.filename] = None
                 # check if target has all the chunks
                 if self.DB.split_complete and len(target.chunks_owned) == \
                         self.DB.chunkCount:
@@ -495,6 +497,7 @@ class CpPoll(CmdPoll):
                     self.commandq.put(catCmd)
             else:
                 # transfer failed?
+                self.DB.workl.append((target, chunk))#E2
                 if chunk not in target.chunks_needed:
                     target.chunks_needed.append(chunk)
                 if self.options.verbose:
@@ -515,6 +518,7 @@ class CpPoll(CmdPoll):
             pass
         except Exception:
             # failed to start transfer?
+            self.DB.workl.append((target, chunk))#E2
             if chunk not in target.chunks_needed:
                 target.chunks_needed.append(chunk)
             print 'ERROR Poll.handle_output: ', sys.exc_info()[1]
@@ -532,12 +536,11 @@ class Host:
         self.hostname = hostname
         self.transferslots = max_transfers_per_host
         self.chunks_needed = chunks_needed
-        self.chunks_owned = []
+        self.chunks_owned = {}
         self.lock = threading.Lock()
         self.alive = True
         self.DB = DB
         self.user = user
-        self.chunk_index = 0 # index into root node's chunks_needed
         self.failcount = 0
         self.max_failcount = max_failcount
 
@@ -602,6 +605,7 @@ class Database:
         self.split_complete = False
         self.deadhosts = 0
         self.roothost = None
+        self.workl = []
 
     def incDeadHosts(self):
         ''' call after setting a Host instance as dead, lets the script
@@ -616,55 +620,39 @@ class Database:
         self.hosts_with_file += 1
         self.lock.release()
 
-    # this version will return an available transfer if one exists
-    def getTransfer(self):
-        ''' Returns (seed, target, chunk) which will be passed to a transfer 
-        thread '''
-        for q in xrange(self.hostcount):
-            # choose a target
-            self.tindex = (self.tindex+1) % self.hostcount
-            # check if chosen target is alive and has an open slot
-            if self.hostlist[self.tindex].transferslots > 0 and \
-                    self.hostlist[self.tindex].alive is True:
-                # transfer first chunk needed we find
-                sindex = random.randint(0, self.hostcount)
-                for chunk in self.hostlist[self.tindex].chunks_needed:
-                    # now, find a seed with the needed chunk
-                    
-                    # random seed choice
-                    #moved up
-                    # or fixed first seed
-                    #sindex = self.tindex
-                    for i in xrange(self.hostcount):
-                        # +/- 1 may affect some things
-                        sindex = (sindex - 1) % self.hostcount
-                        if chunk in self.hostlist[sindex].chunks_owned and \
-                                self.hostlist[sindex].transferslots > 0 and \
-                                self.hostlist[sindex].alive is True:
-                            # found a seed
-                            self.hostlist[sindex].getSlot()
-                            self.hostlist[self.tindex].getSlot() # right spot?
-                            return sindex, self.tindex, chunk
-        # couldn't match up a transfer
-        print 'no match'
+
+    def getTransfer(self): #E2
+        ''' match a target and chunk with a seed '''
+        seed = target = chunk = None
+        for x in range(len(self.workl)):
+            try:
+                target, chunk = self.workl.pop(0)
+                if target.transferslots < 1:
+                    self.workl.append((target, chunk))
+                    continue
+                # now find a seed
+                for host in self.hostlist:
+                    if chunk.filename in host.chunks_owned and \
+                            host.alive and host.transferslots > 0:
+                        return host, target, chunk
+                # no seeder, put work back on the queue
+                self.workl.append((target, chunk))
+            except IndexError:
+                break
+
         return None, None, None
 
-
     # update chunks_needed list of each host
-    def update_chunks_needed(self):
+    def update_chunks_needed(self, chunkname):
         ''' this method is called from split_file() everytime a new chunk has
         been created. It updates the chunks needed lists of each host '''
+        chunk = Chunk(chunkname)
         for host in self.hostlist:
             if host == self.roothost: continue # root is updated in split_file()
-            if host.chunk_index < (self.chunkCount):
-                new_chunks = self.roothost.chunks_owned[host.chunk_index:]
-                #host.chunks_needed += new_chunks # method 1
-                for chunk in new_chunks: # method 2
-                    host.chunks_needed.insert( \
-                        random.randint(0, len(host.chunks_needed)+1), chunk)
-                # want to randomize order of chunks in list
-                #random.shuffle(host.chunks_needed) # method 3
-                host.chunk_index += len(new_chunks)
+            self.workl.insert( \
+                random.randint(0, len(self.workl) + 1), (host, chunk))
+            host.chunks_needed.insert( \
+                random.randint(0, len(host.chunks_needed)+1), chunk)
 
 
 class Splitter(threading.Thread):
@@ -692,9 +680,9 @@ class Splitter(threading.Thread):
             except Exception:
                 #print 'err split', sys.exc_info()[1]
                 prevname = None
-            DB.roothost.chunks_owned.append(Chunk(curname))
+            DB.roothost.chunks_owned[curname] = None
             DB.chunkCount += 1
-            DB.update_chunks_needed()
+            DB.update_chunks_needed(curname)
             curname = prevname
 
         print 'split complete!'
@@ -714,20 +702,18 @@ def initiateTransfers(DB, options, commandq, copyq):
 
     # loop until every available host has the entire file
     while DB.hosts_with_file + DB.deadhosts < DB.hostcount:
-        seedindex, targetindex, chunk = DB.getTransfer()
-        if chunk:
-            target = DB.hostlist[targetindex]
-            seed = DB.hostlist[seedindex]
+        seed, target, chunk = DB.getTransfer()
+        if seed is not None:
             # begin the transfer
-            try:
-                cmd = options.cp_cmd_template % \
-                    (options.username+DB.hostlist[seedindex].hostname, \
-                         chunk.filename, options.username + \
-                         DB.hostlist[targetindex].hostname, chunk.filename)
-                copyq.put((cmd, seed, target, chunk))
-                DB.hostlist[targetindex].chunks_needed.remove(chunk)
-            except Exception:
-                pass
+            #print 'qd: %s -> %s : %s' % \
+            #    (seed.hostname,target.hostname,chunk.filename) #debug
+            seed.getSlot()
+            target.getSlot()
+            cmd = options.cp_cmd_template % \
+                (options.username + seed.hostname, chunk.filename, \
+                     options.username + target.hostname, chunk.filename)
+            copyq.put((cmd, seed, target, chunk))
+            target.chunks_needed.remove(chunk)
         else:
             # having sleep prevents repeated failed calls to DB.getTransfer()
             # but the sleep() may also slow it down.
@@ -856,12 +842,16 @@ def main():
             print 'invalid option: %s' % opt
 
 
+    if targetlist == []:
+        print 'No target hosts, exiting ...'
+        sys.exit(1)
+
     # set up a list database of all hosts
     DB = Database()
     rootname = gethostname()
     DB.roothost =  Host(rootname, DB, [], options.username, \
-                            max_transfers_per_host))
-    DB.hostlist.append(roothost)    
+                            max_transfers_per_host)
+    DB.hostlist.append(DB.roothost)    
     if rootname in targetlist:
         targetlist.remove(rootname)
     targetlist = set(targetlist) # remove duplicates
@@ -869,7 +859,6 @@ def main():
         DB.hostlist.append(Host(target, DB, [], options.username, \
                                     max_transfers_per_host))
     DB.hostcount = len(DB.hostlist)
-
 
     # build prefix for file chunk names
     options.chunk_basename = \
@@ -962,7 +951,7 @@ def main():
         commandq.killprocs() # stop current processes (calls to cat)
         copyq.killprocs() # kill calls to scp
         for thread in (split_thread, copyq, copyp):
-            thread.kill()
+            thread.kill() 
         print '[!] aborted transfers'
     except Exception:
         commandq.killprocs()
@@ -981,7 +970,7 @@ def main():
             print 'removing chunks ...'
             for host in DB.hostlist:
                 rmCmd = rm_cmd_template % \
-                    (options.username+host.hostname, options.chunk_basename)
+                    (options.username + host.hostname, options.chunk_basename)
                 commandq.put(rmCmd)
     except KeyboardInterrupt:
         print '[!] Aborted chunk clean up'
