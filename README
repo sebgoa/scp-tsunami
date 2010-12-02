@@ -2,21 +2,23 @@ files included in this repository:
 
 scpTsunami.py
 This is the original version of the script, used for measuring improvements
-made in newer versions. Only modifications on this file are to fix bugs.
+made in newer versions. Only modifications to this file are to fix bugs.
 
 scpTsunamiA.py
 This is a stable, improved version of scpTsunami.py.
 
 scpTsunamiB.py
-This version adds improvements to scpTsunamiA.py, but is not considered
-stable.
+This version adds improvements to scpTsunamiA.py.
 
 scpTsunamiE.py
 'E' for experimental. This is where new ideas are tested.
+Currently, this version polls the scp processes instead of creating a
+thread to wait for each process to finish. Version B is much quicker but
+it uses more threads.
 
-E2 vs B2
-E uses asynch scp calls
-B uses threads still
+verify.py
+Simple script that compares md5 of local file to the transferred file on
+each target host.
 
 
 changes made in later versions that should be implemented in all:
