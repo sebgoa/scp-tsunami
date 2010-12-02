@@ -1,10 +1,10 @@
 #!/usr/bin/env python
 
 '''
-scpTsunamiE2.py - implements commandqueue in version A to reduce number of threads.
+scpTsunamiE.py - implements commandqueue in version A to reduce number of threads.
 adds command queueing for scp commands, unlike ver B
 
-Ver E2 aims to speed up getTransfer() using dicts for chunks_owned
+Ver E aims to speed up getTransfer() using dicts for chunks_owned
 
 ===============================================================================
 VERSION
@@ -163,7 +163,7 @@ RSYNC_CMD_TEMPLATE = 'ssh -o StrictHostKeyChecking=no %s rsync -c %s %s:%s'
 CHUNK_DIR = '/local_scratch'
 
 def _usage():
-    print '''
+    print '''\
 Usage
  Transfer a file
  ./scpTsunami.py <file> <filedest> [-s][-v] [-u <username>] [-f <hostfile>]
@@ -173,7 +173,7 @@ Usage
                  [-l '<host1> <host2> ...'] [-r 'basehost[0-1,4-6,...]']'''
 
 def _help():
-    print '''
+    print '''\
 Arguments
   If the first argument is 'clean', scpTsunami will attempt to remove chunks
   from a prior transfer of the filename given as the second argument. Else,
@@ -440,6 +440,33 @@ class CmdPoll(KillableThread):
                 break
             active_procs = []
             #proc, seed, target, chunk
+            for proc, vals in self.procs:
+                ret = proc.poll()
+                if ret is not None:
+                    # process is done
+                    self.procsema.release()
+                    self.handle_output(ret, proc, vals)
+                else:
+                    # process is still active
+                    active_procs.append((proc, vals))
+            # empty process list and insert ONLY active processes
+            while len(self.procs) > 0:
+                self.procs.pop()
+            map(self.procs.append, active_procs)
+            time.sleep(0.2)
+        print 'Poll done'
+
+    def run2(self):
+        ''' Poll processes and if they are finished, handle the output '''
+        while not self.killflag.isSet():
+            # check for request to exit
+            if self.finishflag.isSet() and len(self.procs) == 0:
+                break
+            active_procs = []
+            #proc, seed, target, chunk
+            
+            
+
             for proc, vals in self.procs:
                 ret = proc.poll()
                 if ret is not None:

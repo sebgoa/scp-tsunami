@@ -140,10 +140,10 @@ from socket import gethostname
 from subprocess import Popen, PIPE, STDOUT
 
 ### global data ###
-MAX_TRANSFERS_PER_HOST = 4
+MAX_TRANSFERS_PER_HOST = 5
 # most threads will be running a subprocess for scp, so limits the number of
 #  concurrent transfers.
-MAX_THREADS = 250
+MAX_THREADS = 300
 MAX_PROCS = 500 # each proc will be a call to rm or cat
 
 # shell commands
@@ -161,7 +161,7 @@ MAX_FAILCOUNT = 3 # maximum consecutive connection failures allowed per host
 CHUNK_DIR = '/local_scratch' # where to put chunks
 
 def _usage():
-    print '''
+    print '''\
 Usage
  Transfer a file
  ./scpTsunami.py <file> <filedest> [-s][-v] [-u <username>] [-f <hostfile>]
@@ -171,7 +171,7 @@ Usage
                  [-l '<host1> <host2> ...'] [-r 'basehost[0-1,4-6,...]']'''
 
 def _help():
-    print '''
+    print '''\
 Arguments
   If the first argument is 'clean', scpTsunami will attempt to remove chunks
   from a prior transfer of the filename given as the second argument. Else,
@@ -296,12 +296,12 @@ class CommandQueue(threading.Thread):
                 while self.procsema.acquire(blocking=False) == False:
                     # sema is full, free slots
                     if not self.free():
-                        time.sleep(0.5)
+                        time.sleep(0.2)
                 # we have a cmd and a semaphore slot, run the cmd
                 proc = Popen(shlex.split(cmd), stdout=PIPE, stderr=STDOUT)
                 self.procs.append(proc)
             except Queue.Empty:
-                time.sleep(0.5)
+                time.sleep(0.2)
                 if self.flag.isSet():
                     break
         # out of loop, wait for running procs
@@ -357,6 +357,7 @@ class Host:
         self.hostname = hostname
         self.transferslots = max_transfers_per_host
         self.chunks_needed = chunks_needed
+        # chunks_owned is a dict for quick lookup
         self.chunks_owned = {}
         self.lock = threading.Lock()
         self.alive = True
@@ -514,7 +515,7 @@ class Transfer(threading.Thread):
                 if seed.failcount > 0:
                     seed.resetFailCount()
                 # transfer succeeded
-                if self.options.verbose:
+                if False:#self.options.verbose:
                     print '%s(%d) -> %s(%d) : (%s) success' % \
                         (seed.hostname, seed.transferslots, target.hostname, \
                              target.transferslots, self.chunk.filename)
@@ -592,7 +593,7 @@ def initiateTransfers(DB, threadsema, options, threadlist, commandq):
         else:
             # having sleep prevents repeated failed calls to DB.getTransfer()
             # but the sleep() may also slow it down..
-            time.sleep(0.2)
+            time.sleep(0.1)
 
     # wait for transfers to complete before returning
     while threadlist != []:
@@ -655,11 +656,12 @@ def main():
     # get the command line options
     try:
         optlist, args = getopt.gnu_getopt( \
-            sys.argv[1:], 't:u:f:r:l:b:svhp', ['help', 'rsync', 'scp', 'rcp',\
+            sys.argv[1:], 't:u:f:r:l:b:svhp', ['help', 'rsync', 'scp', 'rcp', \
                                                    'chunkdir=','logfile='])
         for opt, arg in optlist:
             if opt in ('-h', '--help'):
                 _usage()
+                print
                 _help()
                 sys.exit(1)
     except Exception:
