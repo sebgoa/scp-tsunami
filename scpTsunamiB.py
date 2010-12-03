@@ -113,10 +113,7 @@ Ideas for Performance
 To Fix
   1. output from 'split' not consistent on some machines 
      Getting index error with attempting to split the output lines.
-  2. transferring really small files - fixed?
-  3. CommandQueue and CpCommandQueue share same semaphore but CommandQueue
-     is lazy about releasing the semaphore. Have 2 separate semas or have
-     a Poll() for CommandQueue
+  2. transferring files smaller than chunk size - fixed?
 
 ------
 Issues
@@ -427,6 +424,8 @@ class Database:
         self.split_complete = False
         self.deadhosts = 0
         self.roothost = None
+        # workl contains (target, chunk) tuples for each chunk a target needs.
+        #  this saves time in looping over target.chunks_needed.
         self.workl = []
 
     def incDeadHosts(self):
@@ -442,7 +441,7 @@ class Database:
         self.hosts_with_file += 1
         self.lock.release()
 
-    def getTransfer(self): #E2
+    def getTransfer(self):
         ''' match a target and chunk with a seed '''
         seed = target = chunk = None
         for x in range(len(self.workl)):
@@ -463,6 +462,8 @@ class Database:
             except IndexError:
                 # workl is empty
                 break
+
+        # unable to match a target and seed
         return None, None, None
 
     def update_chunks_needed(self, chunkname):
@@ -471,7 +472,8 @@ class Database:
         chunk = Chunk(chunkname)
         for host in self.hostlist:
             if host == self.roothost:
-                continue # root is updated in split_file()
+                continue # root doesnt need any chunks, skip it
+            # use random insertion so hosts aren't trying to get the same chunk
             host.chunks_needed.insert( \
                 random.randint(0, len(host.chunks_needed)+1), chunk)
             self.workl.insert( \
@@ -643,15 +645,16 @@ class Splitter(threading.Thread):
 
 def main():
     # init defaults
-    options = Options()
     max_threads = MAX_THREADS
     max_procs = MAX_PROCS
     max_transfers_per_host = MAX_TRANSFERS_PER_HOST
     rm_cmd_template = RM_CMD_TEMPLATE
     cat_cmd_template = CAT_CMD_TEMPLATE
     logfile = LOG_FILE
-    cleanonly = False # just remove chunks and exit
     chunkdir = CHUNK_DIR
+    
+    cleanonly = False # just remove chunks and exit
+    options = Options()
 
     # get the command line options
     try:
@@ -669,16 +672,18 @@ def main():
         sys.exit(2)
 
     if len(args) < 2:
-        print 'ERROR: 2 args required'
+        print 'ERROR: file and file destination required'
         _usage()
         sys.exit(2)
 
     # get name of file to transfer
     try:
         if args[0] == 'clean':
+            # remove chunks from targets, no transfers
             cleanonly = True
             options.filename = args[1]
         else:
+            # transfer file
             options.filename = args[0]
             filepath = os.path.abspath(options.filename)
             if not os.path.isfile(filepath):
@@ -691,7 +696,8 @@ def main():
         sys.exit(2)
 
 
-    # parse the command line
+    # parse the command line options
+    # targetlist contains hostname's of targets to receive file
     targetlist = [] # takes Host(hostname) 
     for opt, arg in optlist:
         if opt == '-f': # file
@@ -726,8 +732,7 @@ def main():
                 sys.exit(2)
         elif opt == '-l':
             # read quoted list of comma separated hosts from command line
-            hostlist = arg.split()
-            for host in hostlist:
+            for host in arg.split():
                 targetlist.append(host.strip())
         elif opt == '-b':
             options.chunksize = arg
@@ -858,7 +863,7 @@ def main():
 if __name__ == '__main__':
     try:
         main()
-        print 'active thread count:', threading.activeCount()
+        print 'active thread count:', threading.activeCount() #debug
         print 'done'
     except SystemExit:
         pass

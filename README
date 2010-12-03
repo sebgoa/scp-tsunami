@@ -1,4 +1,9 @@
+README for scpTsunami
+
+==================================
 files included in this repository:
+
+*NOTE - scpTsunamiB.py is currently the best version.
 
 scpTsunami.py
 This is the original version of the script, used for measuring improvements
@@ -20,6 +25,12 @@ verify.py
 Simple script that compares md5 of local file to the transferred file on
 each target host.
 
+====
+todo
+
+The algorithm for matching seeds and targets uses a lot of CPU and should
+be improved. I have been able to reduce CPU utilization with the current
+algorithm but it is still a hog.
 
 changes made in later versions that should be implemented in all:
 1) dicts for Host.chunks_owned
