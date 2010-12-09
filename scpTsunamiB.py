@@ -61,7 +61,7 @@ Platform Specific Issues
      output. Has created problems on some machines.
   2. I have noticed that some machines have different versions of rcp.
      If you choose to use rcp, modify RCP_CMD_TEMPLATE with the full
-     path the the rcp you want to use.
+     path to the rcp you want to use.
 
 -----------
 Usage Notes
