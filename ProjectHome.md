@@ -1,0 +1,1 @@
+scp-tsunami is a Python script for transferring large files to hosts on a network. It improves upon its predecessor [scp-wave](https://code.google.com/p/scp-wave/) by borrowing ideas from bitTorrent. It will split a file into chunks and transfer parts of the whole file using scp. These chunks are rebuilt by the receiving hosts once all chunks are received.
